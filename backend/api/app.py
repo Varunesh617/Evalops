@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
-from backend.api.routes import evals, optimization, pipelines, traces
+from backend.api.routes import evals, optimization, pipelines, plugins, traces, tuning
 from backend.api.websocket import router as ws_router
 
 logger = structlog.get_logger(__name__)
@@ -165,6 +165,8 @@ def create_app() -> FastAPI:
     application.include_router(evals.router)
     application.include_router(traces.router)
     application.include_router(optimization.router)
+    application.include_router(plugins.router)
+    application.include_router(tuning.router)
     application.include_router(ws_router)
 
     # --- Health check -------------------------------------------------------
