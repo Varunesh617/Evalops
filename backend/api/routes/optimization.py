@@ -210,8 +210,10 @@ async def _execute_sweep_background(
                 "trials_completed": sweep_result.trials_completed,
                 "best_value": sweep_result.best_composite_score,
                 "best_params": best_params,
-                "all_trials": trial_dicts,
-                "pareto_frontier": [p.model_dump() for p in pareto_frontier],
+                "metadata": {
+                    "all_trials": trial_dicts,
+                    "pareto_frontier": [p.model_dump() for p in pareto_frontier],
+                },
                 "completed_at": datetime.now(UTC),
             },
         )
@@ -258,8 +260,7 @@ async def start_sweep(
         "timeout_seconds": body.timeout_seconds,
         "started_at": now,
         "estimated_completion": estimated,
-        "all_trials": [],
-        "pareto_frontier": [],
+        "metadata": {},
     }
     await sweep_repo.create(record)
 
@@ -330,12 +331,12 @@ async def get_pareto_frontier(
             detail=f"Sweep {sweep_id} has not completed yet (status={record['status']})",
         )
 
-    stored_frontier = record.get("pareto_frontier", [])
+    stored_frontier = record.get("metadata", {}).get("pareto_frontier", [])
     frontier = [ParetoPoint(**p) for p in stored_frontier]
 
     # Fallback: compute on-the-fly if stored frontier is empty but trials exist
     if not frontier:
-        all_trials = record.get("all_trials", [])
+        all_trials = record.get("metadata", {}).get("all_trials", [])
         frontier = _compute_pareto_frontier(all_trials)
 
     return ParetoResponse(

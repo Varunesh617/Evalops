@@ -46,7 +46,13 @@ _schema_gen = ConfigSchemaGenerator()
 @router.get("/preferences")
 async def get_preferences(user_id: str = "default", domain: str = "general") -> dict[str, Any]:
     """Get user preferences, creating defaults if needed."""
-    domain_enum = DomainType(domain)
+    try:
+        domain_enum = DomainType(domain)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid domain: {domain}. Valid: {[d.value for d in DomainType]}",
+        )
     prefs = _pref_manager.get_or_create(user_id, domain_enum)
     return prefs.model_dump(mode="json")
 
@@ -202,7 +208,15 @@ async def update_optimization_config(
     """Update optimization goals and constraints."""
     prefs = _pref_manager.get_or_create(user_id)
 
-    obj_enum = OptimizationGoal(objective) if objective else None
+    obj_enum = None
+    if objective:
+        try:
+            obj_enum = OptimizationGoal(objective)
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid objective: {objective}. Valid: {[g.value for g in OptimizationGoal]}",
+            )
     prefs.optimization = _opt_configurator.update_preferences(
         prefs.optimization,
         objective=obj_enum,
@@ -245,11 +259,18 @@ async def create_preset(
     prefs = _pref_manager.get(user_id)
     if prefs is None:
         raise HTTPException(status_code=404, detail="No preferences found for this user.")
+    try:
+        domain_enum = DomainType(domain)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid domain: {domain}. Valid: {[d.value for d in DomainType]}",
+        )
     preset = _preset_manager.create_preset(
         name,
         prefs,
         description=description,
-        domain=DomainType(domain),
+        domain=domain_enum,
     )
     return preset.model_dump()
 
@@ -294,12 +315,19 @@ async def get_smart_defaults(
     total_runs: int = 0,
 ) -> dict[str, Any]:
     """Get AI-powered configuration recommendations."""
+    try:
+        domain_enum = DomainType(domain)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid domain: {domain}. Valid: {[d.value for d in DomainType]}",
+        )
     stats = PipelineUsageStats(
         avg_cost_usd=avg_cost,
         avg_latency_ms=avg_latency_ms,
         avg_quality=avg_quality,
         total_runs=total_runs,
-        domain=DomainType(domain),
+        domain=domain_enum,
     )
     engine = SmartDefaults(stats)
     result = engine.generate()
