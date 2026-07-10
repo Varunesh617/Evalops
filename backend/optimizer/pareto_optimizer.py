@@ -230,8 +230,6 @@ class ParetoOptimizer:
 
     async def run(self) -> ParetoResult:
         """Execute the multi-objective search and return the Pareto front."""
-        import asyncio
-
         study = self._create_study()
         all_evals: list[dict[str, Any]] = []
         start = time.monotonic()
@@ -247,7 +245,7 @@ class ParetoOptimizer:
                 import anyio
 
                 outcome = await anyio.to_thread.run_sync(
-                    lambda: _run_eval_fn_sync(self._eval_fn, config),
+                    lambda c=config: _run_eval_fn_sync(self._eval_fn, c),
                 )
             except Exception:
                 logger.exception("pareto_optimizer.trial_failed", trial=trial_num)
