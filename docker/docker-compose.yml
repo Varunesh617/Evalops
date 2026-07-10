@@ -1,0 +1,88 @@
+version: "3.9"
+
+services:
+  # ---- Backend API ----
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    container_name: evalops-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://evalops:evalops@postgres:5432/evalops
+      - REDIS_URL=redis://redis:6379/0
+      - ENVIRONMENT=development
+      - LOG_LEVEL=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - evalops-net
+
+  # ---- PostgreSQL + pgvector ----
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: evalops-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: evalops
+      POSTGRES_PASSWORD: evalops
+      POSTGRES_DB: evalops
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evalops -d evalops"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - evalops-net
+
+  # ---- Redis (Celery broker) ----
+  redis:
+    image: redis:7-alpine
+    container_name: evalops-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - evalops-net
+
+  # ---- Frontend (Next.js) ----
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: evalops-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_WS_URL=ws://localhost:8000/ws/traces
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - evalops-net
+
+volumes:
+  pgdata:
+  redisdata:
+
+networks:
+  evalops-net:
+    driver: bridge

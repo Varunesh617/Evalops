@@ -1,0 +1,50 @@
+# EvalOps Backend — Multi-stage Docker build
+# Python 3.13-slim, non-root, health-checked
+
+# ---- Stage 1: Builder ----
+FROM python:3.13-slim AS builder
+
+WORKDIR /build
+
+COPY pyproject.toml README.md ./
+COPY backend/ backend/
+
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir --prefix=/install .
+
+
+# ---- Stage 2: Runtime ----
+FROM python:3.13-slim AS runtime
+
+LABEL maintainer="EvalOps Team" \
+      description="EvalOps API backend" \
+      version="0.1.0"
+
+# Install curl for healthcheck
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root user
+RUN groupadd -r evalops && useradd --no-log-init -r -g evalops evalops
+
+WORKDIR /app
+
+# Copy installed packages from builder
+COPY --from=builder /install /usr/local
+
+# Copy application code
+COPY backend/ backend/
+COPY scripts/ scripts/
+
+# Ownership
+RUN chown -R evalops:evalops /app
+
+USER evalops
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+ENTRYPOINT ["uvicorn", "backend.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
