@@ -182,13 +182,15 @@ class PipelineExecutor:
         Optional external tracer.  One is created automatically when omitted.
     """
 
-    DEFAULT_STEPS: list[PipelineStep] = [
-        RetrieveStep(),
-        RerankStep(),
-        ReasonStep(),
-        GuardrailStep(),
-        GenerateStep(),
-    ]
+    @classmethod
+    def _default_steps(cls) -> list[PipelineStep]:
+        return [
+            RetrieveStep(),
+            RerankStep(),
+            ReasonStep(),
+            GuardrailStep(),
+            GenerateStep(),
+        ]
 
     def __init__(
         self,
@@ -197,7 +199,7 @@ class PipelineExecutor:
         tracer: Tracer | None = None,
     ) -> None:
         self.config = config
-        self.steps = steps if steps is not None else list(self.DEFAULT_STEPS)
+        self.steps = steps if steps is not None else self._default_steps()
         self.tracer = tracer or Tracer(
             sample_rate=config.trace_sample_rate,
         )
@@ -210,45 +212,46 @@ class PipelineExecutor:
         """
         trajectory = self.tracer.start(pipeline_id=self.config.pipeline_id)
         ctx = PipelineContext(config=self.config, trajectory=trajectory, query=query)
+        try:
+            for pipeline_step in self.steps:
+                async with self.tracer.step(trajectory, pipeline_step.name) as step:
+                    try:
+                        result = await pipeline_step.execute(ctx)
+                    except Exception as exc:
+                        result = {
+                            "status": "failed",
+                            "error": str(exc),
+                            "error_type": type(exc).__qualname__,
+                        }
+                        step.payload["result"] = result
+                        raise
 
-        for pipeline_step in self.steps:
-            async with self.tracer.step(trajectory, pipeline_step.name) as step:
-                try:
-                    result = await pipeline_step.execute(ctx)
-                except Exception as exc:
-                    result = {
-                        "status": "failed",
-                        "error": str(exc),
-                        "error_type": type(exc).__qualname__,
-                    }
+                    status = result.pop("status", "success")
                     step.payload["result"] = result
-                    raise
 
-                status = result.pop("status", "success")
-                step.payload["result"] = result
+                    # Record tokens if the step provided them
+                    if "tokens" in result:
+                        tok = result.pop("tokens")
+                        step.tokens = TokenUsage(**tok)
 
-                # Record tokens if the step provided them
-                if "tokens" in result:
-                    tok = result.pop("tokens")
-                    step.tokens = TokenUsage(**tok)
+                    if status == "failed":
+                        step.finish(
+                            status=StepStatus.FAILED,
+                            error=result.get("error"),
+                            error_type=result.get("error_type"),
+                        )
+                        ctx.results[pipeline_step.name] = result
+                        logger.error(
+                            "step_failed",
+                            step=pipeline_step.name,
+                            error=result.get("error"),
+                        )
+                        break  # halt on failure
 
-                if status == "failed":
-                    step.finish(
-                        status=StepStatus.FAILED,
-                        error=result.get("error"),
-                        error_type=result.get("error_type"),
-                    )
                     ctx.results[pipeline_step.name] = result
-                    logger.error(
-                        "step_failed",
-                        step=pipeline_step.name,
-                        error=result.get("error"),
-                    )
-                    break  # halt on failure
-
-                ctx.results[pipeline_step.name] = result
-
-        return self.tracer.finish(trajectory)
+        finally:
+            self.tracer.finish(trajectory)
+        return trajectory
 
 
 # ---------------------------------------------------------------------------

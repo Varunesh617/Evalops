@@ -7,11 +7,14 @@ integrates with OpenTelemetry via bridge adapters.
 
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator
+
+import random
 
 import structlog
 
@@ -21,6 +24,23 @@ if TYPE_CHECKING:
 from backend.core.config import StepStatus
 
 logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _sanitize_error(msg: str) -> str:
+    """Remove potentially sensitive information from error messages."""
+    msg = re.sub(r'postgresql://[^\s]+', 'postgresql://***', msg)
+    msg = re.sub(r'mysql://[^\s]+', 'mysql://***', msg)
+    msg = re.sub(r'mongodb://[^\s]+', 'mongodb://***', msg)
+    msg = re.sub(r'password[=:]\s*\S+', 'password=***', msg)
+    msg = re.sub(r'pwd[=:]\s*\S+', 'pwd=***', msg)
+    msg = re.sub(r'api[_-]?key[=:]\s*\S+', 'api_key=***', msg)
+    msg = re.sub(r'token[=:]\s*\S+', 'token=***', msg)
+    return msg[:500]
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +279,6 @@ class Tracer:
         return step
 
     def _should_sample(self) -> bool:
-        import random
-
         return random.random() < self._sample_rate
 
     @asynccontextmanager
@@ -283,7 +301,7 @@ class Tracer:
         except Exception as exc:
             step.finish(
                 status=StepStatus.FAILED,
-                error=str(exc),
+                error=_sanitize_error(str(exc)),
                 error_type=type(exc).__qualname__,
             )
             raise
