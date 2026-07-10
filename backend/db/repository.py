@@ -1,14 +1,16 @@
-"""Repository pattern for EvalOps database access.
+"""Repository pattern for EvalOps — SQLAlchemy ORM-backed implementations.
 
-Provides a generic :class:`BaseRepository` with CRUD helpers plus
-domain-specific repositories for Pipeline, Trace, Eval, Sweep, and Plugin.
+These repositories match the exact interface of the in-memory repositories
+(returning dicts, using *page* / *page_size* parameters, etc.) so they are
+drop-in replacements when ``DATABASE_URL`` is set.
 """
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from sqlalchemy import func, select
+from sqlalchemy import String, cast, func, select
 from sqlalchemy.orm import DeclarativeBase
 
 from backend.db.models import (
@@ -32,37 +34,60 @@ ModelT = TypeVar("ModelT", bound=DeclarativeBase)
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _obj_to_dict(obj: DeclarativeBase) -> dict[str, Any]:
+    """Convert an ORM instance to a plain dict, stripping SA internals."""
+    return {col.name: getattr(obj, col.name) for col in obj.__table__.columns}
+
+
+def _escape_like(value: str) -> str:
+    """Escape ``%``, ``_`` and ``\\`` for use in SQL LIKE patterns."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+# ---------------------------------------------------------------------------
 # Base repository
 # ---------------------------------------------------------------------------
 
 
 class BaseRepository[ModelT]:
-    """Generic CRUD operations for any SQLAlchemy model."""
+    """Generic CRUD operations for any SQLAlchemy model.
+
+    The interface mirrors the in-memory repositories: *create* takes a dict,
+    *get* / *update* return dicts, and *list* returns a ``(items, total)``
+    tuple with *page* / *page_size* pagination.
+    """
 
     def __init__(self, session: AsyncSession, model: type[ModelT]) -> None:
         self._session = session
         self._model = model
 
-    async def get(self, record_id: str) -> ModelT | None:
-        return await self._session.get(self._model, record_id)
+    async def get(self, record_id: str) -> dict[str, Any] | None:
+        instance = await self._session.get(self._model, record_id)
+        return _obj_to_dict(instance) if instance is not None else None
 
-    async def create(self, **kwargs: Any) -> ModelT:
-        instance = self._model(**kwargs)
+    async def create(self, record: dict[str, Any]) -> dict[str, Any]:
+        instance = self._model(**record)
         self._session.add(instance)
         await self._session.flush()
-        return instance
+        return _obj_to_dict(instance)
 
-    async def update(self, record_id: str, **kwargs: Any) -> ModelT | None:
-        instance = await self.get(record_id)
+    async def update(
+        self, record_id: str, updates: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        instance = await self._session.get(self._model, record_id)
         if instance is None:
             return None
-        for key, value in kwargs.items():
+        for key, value in updates.items():
             setattr(instance, key, value)
         await self._session.flush()
-        return instance
+        return _obj_to_dict(instance)
 
     async def delete(self, record_id: str) -> bool:
-        instance = await self.get(record_id)
+        instance = await self._session.get(self._model, record_id)
         if instance is None:
             return False
         await self._session.delete(instance)
@@ -72,12 +97,15 @@ class BaseRepository[ModelT]:
     async def list(
         self,
         *,
-        offset: int = 0,
-        limit: int = 50,
-    ) -> Sequence[ModelT]:
-        stmt = select(self._model).offset(offset).limit(limit)
+        page: int = 1,
+        page_size: int = 20,
+    ) -> tuple[list[dict[str, Any]], int]:
+        offset = (page - 1) * page_size
+        total = await self.count()
+        stmt = select(self._model).offset(offset).limit(page_size)
         result = await self._session.execute(stmt)
-        return result.scalars().all()
+        items = [_obj_to_dict(o) for o in result.scalars().all()]
+        return items, total
 
     async def count(self) -> int:
         stmt = select(func.count()).select_from(self._model)
@@ -94,34 +122,51 @@ class PipelineRepository(BaseRepository[Pipeline]):
     def __init__(self, session: AsyncSession) -> None:
         super().__init__(session, Pipeline)
 
-    async def get_by_name(self, name: str) -> Pipeline | None:
+    async def get_by_name(self, name: str) -> dict[str, Any] | None:
         stmt = select(Pipeline).where(Pipeline.name == name)
         result = await self._session.execute(stmt)
-        return result.scalar_one_or_none()
+        obj = result.scalar_one_or_none()
+        return _obj_to_dict(obj) if obj is not None else None
 
-    async def list_by_status(
-        self, status: str, *, offset: int = 0, limit: int = 50
-    ) -> Sequence[Pipeline]:
-        stmt = (
-            select(Pipeline)
-            .where(Pipeline.status == status)
-            .offset(offset)
-            .limit(limit)
-        )
-        result = await self._session.execute(stmt)
-        return result.scalars().all()
+    async def list(
+        self,
+        *,
+        status: str | None = None,
+        tag: str | None = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> tuple[list[dict[str, Any]], int]:
+        offset = (page - 1) * page_size
 
-    async def list_by_tag(
-        self, tag: str, *, offset: int = 0, limit: int = 50
-    ) -> Sequence[Pipeline]:
-        stmt = (
-            select(Pipeline)
-            .where(Pipeline.tags.op("jsonb_contains")(f'"{tag}"'))
-            .offset(offset)
-            .limit(limit)
-        )
+        conditions = []
+        if status is not None:
+            conditions.append(Pipeline.status == status)
+        if tag is not None:
+            # M1: Portable JSON array contains — works on both PostgreSQL and
+            # SQLite by casting the JSON column to text and using LIKE.
+            tag_literal = json.dumps(tag)  # e.g. '"production"'
+            conditions.append(
+                cast(Pipeline.tags, String).like(
+                    f"%{_escape_like(tag_literal)}%", escape="\\"
+                )
+            )
+
+        base = select(Pipeline)
+        if conditions:
+            base = base.where(*conditions)
+
+        count_stmt = select(func.count()).select_from(base.subquery())
+        total = (await self._session.execute(count_stmt)).scalar_one()
+
+        stmt = base.order_by(Pipeline.created_at.desc()).offset(offset).limit(page_size)
         result = await self._session.execute(stmt)
-        return result.scalars().all()
+        items = [_obj_to_dict(o) for o in result.scalars().all()]
+        return items, total
+
+    async def update(
+        self, pipeline_id: str, updates: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        return await super().update(pipeline_id, updates)
 
 
 # ---------------------------------------------------------------------------
@@ -133,57 +178,51 @@ class TraceRepository(BaseRepository[Trace]):
     def __init__(self, session: AsyncSession) -> None:
         super().__init__(session, Trace)
 
-    async def list_by_pipeline(
-        self, pipeline_id: str, *, offset: int = 0, limit: int = 50
-    ) -> Sequence[Trace]:
-        stmt = (
-            select(Trace)
-            .where(Trace.pipeline_id == pipeline_id)
-            .order_by(Trace.started_at.desc())
-            .offset(offset)
-            .limit(limit)
-        )
-        result = await self._session.execute(stmt)
-        return result.scalars().all()
+    async def list(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        status: str | None = None,
+        min_cost: float | None = None,
+        max_cost: float | None = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> tuple[list[dict[str, Any]], int]:
+        offset = (page - 1) * page_size
 
-    async def list_by_run(
-        self, run_id: str, *, offset: int = 0, limit: int = 50
-    ) -> Sequence[Trace]:
-        stmt = (
-            select(Trace)
-            .where(Trace.run_id == run_id)
-            .order_by(Trace.started_at.desc())
-            .offset(offset)
-            .limit(limit)
-        )
-        result = await self._session.execute(stmt)
-        return result.scalars().all()
+        conditions: list = []
+        if pipeline_id is not None:
+            conditions.append(Trace.pipeline_id == pipeline_id)
+        if status is not None:
+            conditions.append(Trace.status == status)
+        if min_cost is not None:
+            conditions.append(Trace.total_cost_usd >= min_cost)
+        if max_cost is not None:
+            conditions.append(Trace.total_cost_usd <= max_cost)
 
-    async def list_by_status(
-        self, status: str, *, offset: int = 0, limit: int = 50
-    ) -> Sequence[Trace]:
-        stmt = (
-            select(Trace)
-            .where(Trace.status == status)
-            .order_by(Trace.started_at.desc())
-            .offset(offset)
-            .limit(limit)
-        )
-        result = await self._session.execute(stmt)
-        return result.scalars().all()
+        base = select(Trace)
+        if conditions:
+            base = base.where(*conditions)
 
-    async def get_with_steps(self, trace_id: str) -> Trace | None:
-        stmt = select(Trace).where(Trace.id == trace_id)
+        count_stmt = select(func.count()).select_from(base.subquery())
+        total = (await self._session.execute(count_stmt)).scalar_one()
+
+        stmt = base.order_by(Trace.started_at.desc()).offset(offset).limit(page_size)
         result = await self._session.execute(stmt)
-        trace = result.scalar_one_or_none()
-        if trace is not None:
-            stmt_steps = (
-                select(TraceStep)
-                .where(TraceStep.trace_id == trace_id)
-                .order_by(TraceStep.id)
-            )
-            steps_result = await self._session.execute(stmt_steps)
-            trace.trace_steps = list(steps_result.scalars().all())
+        items = [_obj_to_dict(o) for o in result.scalars().all()]
+        return items, total
+
+    async def get_with_steps(self, trace_id: str) -> dict[str, Any] | None:
+        trace = await self.get(trace_id)
+        if trace is None:
+            return None
+        stmt_steps = (
+            select(TraceStep)
+            .where(TraceStep.trace_id == trace_id)
+            .order_by(TraceStep.id)
+        )
+        steps_result = await self._session.execute(stmt_steps)
+        trace["trace_steps"] = [_obj_to_dict(s) for s in steps_result.scalars().all()]
         return trace
 
     async def count_by_pipeline(self, pipeline_id: str) -> int:
@@ -205,7 +244,7 @@ class RunRepository(BaseRepository[PipelineRun]):
 
     async def list_by_pipeline(
         self, pipeline_id: str, *, offset: int = 0, limit: int = 50
-    ) -> Sequence[PipelineRun]:
+    ) -> Sequence[dict[str, Any]]:
         stmt = (
             select(PipelineRun)
             .where(PipelineRun.pipeline_id == pipeline_id)
@@ -214,9 +253,9 @@ class RunRepository(BaseRepository[PipelineRun]):
             .limit(limit)
         )
         result = await self._session.execute(stmt)
-        return result.scalars().all()
+        return [_obj_to_dict(o) for o in result.scalars().all()]
 
-    async def get_latest(self, pipeline_id: str) -> PipelineRun | None:
+    async def get_latest(self, pipeline_id: str) -> dict[str, Any] | None:
         stmt = (
             select(PipelineRun)
             .where(PipelineRun.pipeline_id == pipeline_id)
@@ -224,7 +263,8 @@ class RunRepository(BaseRepository[PipelineRun]):
             .limit(1)
         )
         result = await self._session.execute(stmt)
-        return result.scalar_one_or_none()
+        obj = result.scalar_one_or_none()
+        return _obj_to_dict(obj) if obj is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +278,7 @@ class EvalRepository(BaseRepository[EvalResult]):
 
     async def list_by_trajectory(
         self, trajectory_id: str, *, offset: int = 0, limit: int = 50
-    ) -> Sequence[EvalResult]:
+    ) -> Sequence[dict[str, Any]]:
         stmt = (
             select(EvalResult)
             .where(EvalResult.trajectory_id == trajectory_id)
@@ -247,11 +287,11 @@ class EvalRepository(BaseRepository[EvalResult]):
             .limit(limit)
         )
         result = await self._session.execute(stmt)
-        return result.scalars().all()
+        return [_obj_to_dict(o) for o in result.scalars().all()]
 
     async def get_best_for_trajectory(
         self, trajectory_id: str
-    ) -> EvalResult | None:
+    ) -> dict[str, Any] | None:
         stmt = (
             select(EvalResult)
             .where(EvalResult.trajectory_id == trajectory_id)
@@ -259,11 +299,12 @@ class EvalRepository(BaseRepository[EvalResult]):
             .limit(1)
         )
         result = await self._session.execute(stmt)
-        return result.scalar_one_or_none()
+        obj = result.scalar_one_or_none()
+        return _obj_to_dict(obj) if obj is not None else None
 
     async def list_high_scores(
         self, min_score: float, *, offset: int = 0, limit: int = 50
-    ) -> Sequence[EvalResult]:
+    ) -> Sequence[dict[str, Any]]:
         stmt = (
             select(EvalResult)
             .where(EvalResult.aggregate_score >= min_score)
@@ -272,7 +313,7 @@ class EvalRepository(BaseRepository[EvalResult]):
             .limit(limit)
         )
         result = await self._session.execute(stmt)
-        return result.scalars().all()
+        return [_obj_to_dict(o) for o in result.scalars().all()]
 
 
 # ---------------------------------------------------------------------------
@@ -281,40 +322,61 @@ class EvalRepository(BaseRepository[EvalResult]):
 
 
 class SweepRepository(BaseRepository[Sweep]):
+    """SQLAlchemy-backed sweep repository.
+
+    The routes pass dicts with a ``sweep_id`` key rather than ``id``.
+    We transparently map ``sweep_id`` → ``id`` on create and add ``sweep_id``
+    back on reads so the rest of the application stays unchanged.
+    """
+
     def __init__(self, session: AsyncSession) -> None:
         super().__init__(session, Sweep)
 
-    async def list_by_pipeline(
-        self, pipeline_id: str, *, offset: int = 0, limit: int = 50
-    ) -> Sequence[Sweep]:
-        stmt = (
-            select(Sweep)
-            .where(Sweep.pipeline_id == pipeline_id)
-            .order_by(Sweep.started_at.desc())
-            .offset(offset)
-            .limit(limit)
-        )
-        result = await self._session.execute(stmt)
-        return result.scalars().all()
+    async def create(self, record: dict[str, Any]) -> dict[str, Any]:
+        mapped = dict(record)
+        if "sweep_id" in mapped:
+            mapped["id"] = mapped.pop("sweep_id")
+        result = await super().create(mapped)
+        result["sweep_id"] = result["id"]
+        return result
 
-    async def get_active(self, pipeline_id: str) -> Sweep | None:
+    async def get(self, sweep_id: str) -> dict[str, Any] | None:
+        result = await super().get(sweep_id)
+        if result is not None:
+            result["sweep_id"] = result["id"]
+        return result
+
+    async def update(
+        self, sweep_id: str, updates: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        result = await super().update(sweep_id, updates)
+        if result is not None:
+            result["sweep_id"] = result["id"]
+        return result
+
+    async def get_active(self, pipeline_id: str) -> dict[str, Any] | None:
         stmt = (
             select(Sweep)
             .where(Sweep.pipeline_id == pipeline_id, Sweep.status == "running")
             .limit(1)
         )
         result = await self._session.execute(stmt)
-        return result.scalar_one_or_none()
+        obj = result.scalar_one_or_none()
+        if obj is None:
+            return None
+        d = _obj_to_dict(obj)
+        d["sweep_id"] = d["id"]
+        return d
 
-    async def add_trial(self, sweep_id: str, **kwargs: Any) -> SweepTrial:
+    async def add_trial(self, sweep_id: str, **kwargs: Any) -> dict[str, Any]:
         trial = SweepTrial(sweep_id=sweep_id, **kwargs)
         self._session.add(trial)
         await self._session.flush()
-        return trial
+        return _obj_to_dict(trial)
 
     async def list_trials(
         self, sweep_id: str, *, offset: int = 0, limit: int = 500
-    ) -> Sequence[SweepTrial]:
+    ) -> Sequence[dict[str, Any]]:
         stmt = (
             select(SweepTrial)
             .where(SweepTrial.sweep_id == sweep_id)
@@ -323,7 +385,7 @@ class SweepRepository(BaseRepository[Sweep]):
             .limit(limit)
         )
         result = await self._session.execute(stmt)
-        return result.scalars().all()
+        return [_obj_to_dict(o) for o in result.scalars().all()]
 
 
 # ---------------------------------------------------------------------------
@@ -335,14 +397,15 @@ class PluginRepository(BaseRepository[Plugin]):
     def __init__(self, session: AsyncSession) -> None:
         super().__init__(session, Plugin)
 
-    async def get_by_name(self, name: str) -> Plugin | None:
+    async def get_by_name(self, name: str) -> dict[str, Any] | None:
         stmt = select(Plugin).where(Plugin.name == name)
         result = await self._session.execute(stmt)
-        return result.scalar_one_or_none()
+        obj = result.scalar_one_or_none()
+        return _obj_to_dict(obj) if obj is not None else None
 
     async def list_by_type(
         self, plugin_type: str, *, offset: int = 0, limit: int = 50
-    ) -> Sequence[Plugin]:
+    ) -> Sequence[dict[str, Any]]:
         stmt = (
             select(Plugin)
             .where(Plugin.plugin_type == plugin_type)
@@ -351,26 +414,28 @@ class PluginRepository(BaseRepository[Plugin]):
             .limit(limit)
         )
         result = await self._session.execute(stmt)
-        return result.scalars().all()
+        return [_obj_to_dict(o) for o in result.scalars().all()]
 
     async def increment_downloads(self, plugin_id: str) -> None:
-        plugin = await self.get(plugin_id)
+        plugin = await self._session.get(Plugin, plugin_id)
         if plugin is not None:
             plugin.downloads += 1
             await self._session.flush()
 
-    async def search(self, query: str, *, limit: int = 20) -> Sequence[Plugin]:
+    async def search(self, query: str, *, limit: int = 20) -> Sequence[dict[str, Any]]:
+        # M2: LIKE wildcard injection — escape user input before interpolating
+        safe = _escape_like(query)
         stmt = (
             select(Plugin)
             .where(
-                Plugin.name.ilike(f"%{query}%")
-                | Plugin.description.ilike(f"%{query}%")
+                Plugin.name.ilike(f"%{safe}%", escape="\\")
+                | Plugin.description.ilike(f"%{safe}%", escape="\\")
             )
             .order_by(Plugin.downloads.desc())
             .limit(limit)
         )
         result = await self._session.execute(stmt)
-        return result.scalars().all()
+        return [_obj_to_dict(o) for o in result.scalars().all()]
 
 
 # ---------------------------------------------------------------------------
@@ -384,17 +449,18 @@ class UserConfigRepository(BaseRepository[UserConfig]):
 
     async def get_for_user_pipeline(
         self, user_id: str, pipeline_id: str
-    ) -> UserConfig | None:
+    ) -> dict[str, Any] | None:
         stmt = select(UserConfig).where(
             UserConfig.user_id == user_id,
             UserConfig.pipeline_id == pipeline_id,
         )
         result = await self._session.execute(stmt)
-        return result.scalar_one_or_none()
+        obj = result.scalar_one_or_none()
+        return _obj_to_dict(obj) if obj is not None else None
 
     async def list_for_user(
         self, user_id: str, *, offset: int = 0, limit: int = 50
-    ) -> Sequence[UserConfig]:
+    ) -> Sequence[dict[str, Any]]:
         stmt = (
             select(UserConfig)
             .where(UserConfig.user_id == user_id)
@@ -402,4 +468,4 @@ class UserConfigRepository(BaseRepository[UserConfig]):
             .limit(limit)
         )
         result = await self._session.execute(stmt)
-        return result.scalars().all()
+        return [_obj_to_dict(o) for o in result.scalars().all()]
