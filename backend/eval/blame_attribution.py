@@ -408,7 +408,7 @@ class BlameAttributionEngine:
                 score=root_step.metrics.score or 0.0,
             )
 
-        cascade = self._build_cascade(root_index, steps, root_step) if rule else []
+        cascade = self._build_cascade(root_index, steps, rule) if rule else []
         counterfactuals = self._counterfactuals(root_index, steps, trajectory)
         remediation = self._suggest_remediation(root_step, failure_mode)
         rubric = self._build_rubric(trajectory, root_step, failure_mode)

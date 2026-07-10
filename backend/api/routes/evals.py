@@ -1,58 +1,29 @@
-"""Evaluation routes — run, retrieve, and compare evals."""
+"""Evaluation routes — run, retrieve, and compare evals using the real EvalEngine."""
 
 from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated
 
 import structlog
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
+from backend.api.dependencies import get_eval_engine, get_eval_repository
 from backend.api.schemas import (
-    EvalCompareRequest,
     EvalCompareResponse,
     EvalResultResponse,
     EvalRunRequest,
 )
+from backend.eval.engine import EvalEngine
+from backend.eval.metrics import METRIC_REGISTRY
+from backend.eval.models import Trajectory as EvalTrajectory
+from backend.db.repositories import EvalRepository
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/evals", tags=["evals"])
 
-# ---------------------------------------------------------------------------
-# In-memory store
-# ---------------------------------------------------------------------------
-
-_evals: dict[str, dict[str, Any]] = {}
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-AVAILABLE_METRICS = {
-    "faithfulness",
-    "context_relevance",
-    "trajectory_coherence",
-    "tool_call_accuracy",
-    "guardrail_fp_rate",
-    "cost_efficiency",
-}
-
-
-def _compute_scores(trajectory: dict[str, Any], metrics: list[str]) -> dict[str, float]:
-    """Run metric evaluations and return metric → score mapping.
-
-    This delegates to the real engine when available; falls back to placeholder
-    scoring so the API is testable end-to-end without the full engine installed.
-    """
-    scores: dict[str, float] = {}
-    for metric in metrics:
-        if metric not in AVAILABLE_METRICS:
-            continue
-        # Placeholder: real engine integration plugs in here
-        scores[metric] = 0.0
-    return scores
+AVAILABLE_METRICS = set(METRIC_REGISTRY.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -61,8 +32,12 @@ def _compute_scores(trajectory: dict[str, Any], metrics: list[str]) -> dict[str,
 
 
 @router.post("", response_model=EvalResultResponse, status_code=201)
-async def run_eval(body: EvalRunRequest) -> EvalResultResponse:
-    """Run an evaluation on a trajectory."""
+async def run_eval(
+    body: EvalRunRequest,
+    eval_repo: Annotated[EvalRepository, Depends(get_eval_repository)],
+    engine: Annotated[EvalEngine, Depends(get_eval_engine)],
+) -> EvalResultResponse:
+    """Run an evaluation on a trajectory using the real EvalEngine."""
     invalid = [m for m in body.metrics if m not in AVAILABLE_METRICS]
     if invalid:
         raise HTTPException(
@@ -71,25 +46,53 @@ async def run_eval(body: EvalRunRequest) -> EvalResultResponse:
             f"Available: {', '.join(sorted(AVAILABLE_METRICS))}",
         )
 
-    trajectory = body.trajectory
-    trajectory_id = trajectory.get("trajectory_id", f"traj-{uuid.uuid4().hex[:12]}")
+    trajectory_data = body.trajectory
+    trajectory_id = trajectory_data.get(
+        "trajectory_id", f"traj-{uuid.uuid4().hex[:12]}"
+    )
 
-    scores = _compute_scores(trajectory, body.metrics)
-    agg = sum(scores.values()) / len(scores) if scores else 0.0
+    # Build an engine scoped to the requested metrics
+    scoped_engine = EvalEngine.from_names(body.metrics)
+
+    # Parse the trajectory dict into the eval Trajectory model
+    try:
+        eval_trajectory = EvalTrajectory(**trajectory_data)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid trajectory payload: {exc}",
+        )
+
+    # Run the real engine
+    eval_result = await scoped_engine.run(eval_trajectory)
 
     eval_id = f"eval-{uuid.uuid4().hex[:12]}"
     now = datetime.now(UTC)
+
+    scores = eval_result.scores
+    agg = eval_result.aggregate_score
+
+    # Serialise metric_details for storage
+    metric_details = [
+        {
+            "metric_name": mr.metric_name,
+            "overall_score": mr.overall_score,
+            "details": mr.details,
+            "step_count": len(mr.step_scores),
+        }
+        for mr in eval_result.metric_results
+    ]
 
     record = {
         "id": eval_id,
         "trajectory_id": trajectory_id,
         "scores": scores,
         "aggregate_score": agg,
-        "metric_details": [],
+        "metric_details": metric_details,
         "status": "completed",
         "created_at": now,
     }
-    _evals[eval_id] = record
+    await eval_repo.create(record)
 
     logger.info(
         "eval_completed",
@@ -101,9 +104,12 @@ async def run_eval(body: EvalRunRequest) -> EvalResultResponse:
 
 
 @router.get("/{eval_id}", response_model=EvalResultResponse)
-async def get_eval(eval_id: str) -> EvalResultResponse:
-    """Retrieve a single evaluation result."""
-    record = _evals.get(eval_id)
+async def get_eval(
+    eval_id: str,
+    eval_repo: Annotated[EvalRepository, Depends(get_eval_repository)],
+) -> EvalResultResponse:
+    """Retrieve a single evaluation result from the DB."""
+    record = await eval_repo.get(eval_id)
     if record is None:
         raise HTTPException(status_code=404, detail=f"Eval {eval_id} not found")
     return EvalResultResponse(**record)
@@ -111,12 +117,13 @@ async def get_eval(eval_id: str) -> EvalResultResponse:
 
 @router.get("/compare", response_model=EvalCompareResponse)
 async def compare_evals(
+    eval_repo: Annotated[EvalRepository, Depends(get_eval_repository)],
     eval_a: str = Query(..., description="First eval ID"),
     eval_b: str = Query(..., description="Second eval ID"),
 ) -> EvalCompareResponse:
     """Compare two evaluation results side-by-side."""
-    rec_a = _evals.get(eval_a)
-    rec_b = _evals.get(eval_b)
+    rec_a = await eval_repo.get(eval_a)
+    rec_b = await eval_repo.get(eval_b)
 
     if rec_a is None:
         raise HTTPException(status_code=404, detail=f"Eval {eval_a} not found")
@@ -129,7 +136,9 @@ async def compare_evals(
     diffs: dict[str, float] = {}
     all_keys = set(a_resp.scores) | set(b_resp.scores)
     for key in all_keys:
-        diffs[key] = round(b_resp.scores.get(key, 0.0) - a_resp.scores.get(key, 0.0), 4)
+        diffs[key] = round(
+            b_resp.scores.get(key, 0.0) - a_resp.scores.get(key, 0.0), 4
+        )
 
     winner: str | None = None
     if a_resp.aggregate_score > b_resp.aggregate_score:
