@@ -10,7 +10,7 @@ from typing import Any
 
 import structlog
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
 
 
 class FilterDecision(str, Enum):
@@ -80,9 +80,10 @@ class BaseFilter(ABC):
 
     name: str = "base"
 
-    def __init__(self, *, enabled: bool = True, threshold: float = 0.5) -> None:
+    def __init__(self, *, enabled: bool = True, threshold: float = 0.5, max_input_length: int = 100_000) -> None:
         self.enabled = enabled
         self.threshold = threshold
+        self._max_input_length = max_input_length
         self._metrics = FilterMetrics()
 
     def check(
@@ -91,6 +92,16 @@ class BaseFilter(ABC):
         """Run the filter and return a ``FilterResult``."""
         if not self.enabled:
             return self._skip_result()
+
+        if len(input_text) > self._max_input_length:
+            return FilterResult(
+                filter_name=self.name,
+                decision=FilterDecision.ALLOW,
+                score=0.0,
+                risk_level=RiskLevel.LOW,
+                details={"skipped": True, "reason": f"Input exceeds max length ({len(input_text)} > {self._max_input_length})"},
+                duration_ms=0.0,
+            )
 
         start = time.perf_counter()
         result = self._check(input_text, context=context, output=output)

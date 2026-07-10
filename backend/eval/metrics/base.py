@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import abc
+import hashlib
+import os
 from typing import Any
 
 import structlog
@@ -10,6 +12,8 @@ import structlog
 from backend.eval.models import MetricResult, Step, StepScore, Trajectory
 
 logger = structlog.get_logger(__name__)
+
+_LOG_QUERIES = os.getenv("LOG_QUERIES", "false").lower() == "true"
 
 
 class BaseMetric(abc.ABC):
@@ -33,10 +37,14 @@ class BaseMetric(abc.ABC):
 
     def evaluate(self, trajectory: Trajectory) -> MetricResult:
         """Run the metric against a full trajectory and return a result."""
+        if _LOG_QUERIES:
+            query_preview = trajectory.query[:120]
+        else:
+            query_preview = hashlib.sha256(trajectory.query.encode()).hexdigest()[:16]
         self._log.debug(
             "evaluating_trajectory",
             step_count=len(trajectory.steps),
-            query=trajectory.query[:120],
+            query=query_preview,
         )
         step_scores: list[StepScore] = []
         for step in trajectory.steps:
