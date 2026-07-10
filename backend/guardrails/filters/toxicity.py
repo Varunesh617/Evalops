@@ -63,7 +63,7 @@ SEXUAL_PATTERNS: list[ToxicityPattern] = [
 ]
 
 SELF_HARM_PATTERNS: list[ToxicityPattern] = [
-    _tp("self_harm", r"\b(?:suicide|suicidal|want\s+to\s+(?:die|end\s+(?:it|my\s+life)))\b", 0.8, "self_harm_reference"),
+    _tp("self_harm", r"\b(?:suicide|suicidal|want\s+to\s+(?:die|kill\s+myself|end\s+(?:it|my\s+life)))\b", 0.8, "self_harm_reference"),
     _tp("self_harm", r"\b(?:cutting|slit\s+(?:my|your)\s+(?:wrists?|throat))\b", 0.85, "self_harm_method"),
 ]
 
