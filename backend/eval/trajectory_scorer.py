@@ -119,7 +119,7 @@ _DEFAULT_WEIGHTS: dict[str, float] = {
 
 
 @dataclass(slots=True)
-class StepScore:
+class StepScoringBreakdown:
     """Score breakdown for a single step."""
 
     step_name: str
@@ -134,7 +134,7 @@ class TrajectoryScore:
 
     run_id: str
     overall_score: float
-    step_scores: list[StepScore] = field(default_factory=list)
+    step_scores: list[StepScoringBreakdown] = field(default_factory=list)
     weakest_step: str = ""
     weakest_score: float = 1.0
 
@@ -195,7 +195,7 @@ class TrajectoryScorer:
     def _score_step(
         self,
         step: TrajectoryStep,
-    ) -> StepScore:
+    ) -> StepScoringBreakdown:
         """Apply all scorers to a single step and compute weighted average."""
         breakdown: dict[str, float] = {}
         score_names = list(self._weights.keys())
@@ -214,7 +214,7 @@ class TrajectoryScorer:
         )
         overall = weighted_sum / total_weight if total_weight > 0 else 1.0
 
-        return StepScore(
+        return StepScoringBreakdown(
             step_name=step.step_name,
             status=step.status,
             score=round(overall, 4),
@@ -223,7 +223,7 @@ class TrajectoryScorer:
 
     def score(self, trajectory: Trajectory) -> TrajectoryScore:
         """Score every step and produce an aggregate report."""
-        step_scores: list[StepScore] = []
+        step_scores: list[StepScoringBreakdown] = []
         weakest_name = ""
         weakest_val = 1.0
 

@@ -15,7 +15,7 @@ import structlog
 from .compounding_analyzer import CompoundingAnalyzer, FPOverlapReport
 from .filters.base import BaseFilter, FilterDecision, FilterMetrics, FilterResult, RiskLevel
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,8 +94,8 @@ class GuardrailStack:
             results.append(result)
             if result.blocked:
                 blocked_filters.extend(result.blocked_by)
-            elif self.fail_fast and result.blocked:
-                break
+                if self.fail_fast:
+                    break
 
         elapsed_ms = (time.perf_counter() - start) * 1000
         overall_passed = all(r.passed for r in results)

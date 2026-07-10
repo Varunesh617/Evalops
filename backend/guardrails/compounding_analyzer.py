@@ -14,7 +14,7 @@ import structlog
 
 from .filters.base import FilterResult
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
