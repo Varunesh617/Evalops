@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
@@ -24,15 +25,23 @@ logger = structlog.get_logger(__name__)
 _rate_buckets: dict[str, tuple[float, int]] = {}
 RATE_LIMIT = 120  # requests per window
 RATE_WINDOW = 60.0  # seconds
+MAX_BUCKETS = 10_000  # prevent unbounded memory growth
 
 
 def _rate_limit_key(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
     if request.client:
         return request.client.host
     return "unknown"
+
+
+def _evict_stale_buckets(now: float) -> None:
+    """Remove entries whose window has expired to free memory."""
+    stale_keys = [
+        key for key, (ts, _) in _rate_buckets.items()
+        if now - ts > RATE_WINDOW
+    ]
+    for key in stale_keys:
+        del _rate_buckets[key]
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -44,6 +53,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         key = _rate_limit_key(request)
         now = time.monotonic()
+
+        # Evict stale entries when approaching or at capacity
+        if len(_rate_buckets) >= MAX_BUCKETS:
+            _evict_stale_buckets(now)
+
+        # If still at capacity after eviction, reject the new key
+        if len(_rate_buckets) >= MAX_BUCKETS and key not in _rate_buckets:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Server is under heavy load. Try again shortly."},
+            )
+
         bucket = _rate_buckets.get(key)
 
         if bucket is None or now - bucket[0] > RATE_WINDOW:
@@ -109,12 +130,18 @@ def create_app() -> FastAPI:
     )
 
     # --- Middleware (order matters: first added = outermost) ----------------
+    cors_origins_raw = os.environ.get("CORS_ORIGINS", "")
+    cors_origins = [
+        o.strip() for o in cors_origins_raw.split(",") if o.strip()
+    ]
+    use_credentials = bool(cors_origins)
+
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=cors_origins or ["*"],
+        allow_credentials=use_credentials,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+        allow_headers=["Authorization", "Content-Type"],
         expose_headers=["X-Process-Time-Ms"],
     )
     application.add_middleware(RateLimitMiddleware)

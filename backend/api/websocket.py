@@ -7,7 +7,7 @@ import json
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(tags=["websocket"])
@@ -68,7 +68,15 @@ class ConnectionManager:
         return len(self._connections)
 
 
-manager = ConnectionManager()
+_manager: ConnectionManager | None = None
+
+
+def get_manager() -> ConnectionManager:
+    """Return the singleton ConnectionManager, creating it on first call."""
+    global _manager
+    if _manager is None:
+        _manager = ConnectionManager()
+    return _manager
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +85,10 @@ manager = ConnectionManager()
 
 
 @router.websocket("/ws/traces")
-async def trace_stream(ws: WebSocket) -> None:
+async def trace_stream(
+    ws: WebSocket,
+    manager: ConnectionManager = Depends(get_manager),
+) -> None:
     """WebSocket endpoint for streaming trace events.
 
     On connect the client should send a JSON subscription message:
@@ -90,7 +101,6 @@ async def trace_stream(ws: WebSocket) -> None:
 
     After that the server streams matching events as they occur.
     """
-    await ws.accept()
 
     # Wait for subscription message (timeout 10s)
     try:
@@ -123,4 +133,4 @@ async def trace_stream(ws: WebSocket) -> None:
 
 async def emit_trace_event(event: dict[str, Any]) -> None:
     """Helper used by pipeline runners / tracer to push events."""
-    await manager.broadcast(event)
+    await get_manager().broadcast(event)
