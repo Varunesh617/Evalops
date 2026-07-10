@@ -12,8 +12,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from backend.api.dependencies import get_sweep_repository
 from backend.api.schemas import (
+    CostReportResponse,
+    DeploymentHistoryResponse,
+    DeploymentRecordResponse,
+    DeployRequest,
+    DeployResponse,
+    ExperimentHistoryResponse,
+    ExperimentLogResponse,
+    ExperimentSearchRequest,
     ParetoPoint,
     ParetoResponse,
+    RollbackRequest,
     SweepRequest,
     SweepStatus,
     SweepStatusResponse,
@@ -25,6 +34,9 @@ from backend.eval.engine import EvalEngine
 from backend.eval.models import Step as EvalStep
 from backend.eval.models import StepType as EvalStepType
 from backend.eval.models import Trajectory as EvalTrajectory
+from backend.optimization.auto_deploy import DeployManager
+from backend.optimization.cost_tracker import CostTracker
+from backend.optimization.experiment_tracker import ExperimentTracker
 from backend.optimizer.config_sweeper import (
     ConfigSweeper,
     EvalOutcome,
@@ -32,6 +44,11 @@ from backend.optimizer.config_sweeper import (
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/optimize", tags=["optimization"])
+
+# Module-level singletons for the optimization subsystems
+_experiment_tracker = ExperimentTracker()
+_cost_tracker = CostTracker()
+_deploy_manager = DeployManager()
 
 
 # ---------------------------------------------------------------------------
@@ -343,4 +360,222 @@ async def get_pareto_frontier(
         sweep_id=sweep_id,
         frontier=frontier,
         total_points=len(frontier),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Deployment routes
+# ---------------------------------------------------------------------------
+
+
+@router.post("/deploy", response_model=DeployResponse, status_code=201)
+async def deploy_config(body: DeployRequest) -> DeployResponse:
+    """Deploy an optimized pipeline configuration."""
+    config = PipelineConfig.model_validate(body.config)
+
+    candidate = _deploy_manager.evaluate_deployment_candidate(
+        pipeline_id=body.pipeline_id,
+        config=config,
+        quality_score=body.quality_score,
+        cost_usd=body.cost_usd,
+        latency_ms=body.latency_ms,
+        trials_completed=body.trials_completed,
+        tests_passed=body.tests_passed,
+    )
+
+    if candidate.status != "approved":
+        raise HTTPException(status_code=422, detail=candidate.message)
+
+    result = _deploy_manager.deploy_config(
+        pipeline_id=body.pipeline_id,
+        config=config,
+        message=body.message,
+    )
+
+    logger.info(
+        "config_deployed",
+        deployment_id=result.deployment_id,
+        pipeline_id=body.pipeline_id,
+    )
+    return DeployResponse(
+        deployment_id=result.deployment_id,
+        pipeline_id=result.pipeline_id,
+        status=result.status,
+        config_diff=result.config_diff,
+        previous_config=result.previous_config,
+        new_config=result.new_config,
+        message=result.message,
+        rollback_id=result.rollback_id,
+        created_at=result.created_at,
+    )
+
+
+@router.post("/rollback", response_model=DeployResponse)
+async def rollback_config(body: RollbackRequest) -> DeployResponse:
+    """Rollback a pipeline to its previous configuration."""
+    result = _deploy_manager.rollback(body.pipeline_id)
+
+    if result.status == "failed":
+        raise HTTPException(status_code=404, detail=result.message)
+
+    logger.info(
+        "config_rolled_back",
+        deployment_id=result.deployment_id,
+        pipeline_id=body.pipeline_id,
+    )
+    return DeployResponse(
+        deployment_id=result.deployment_id,
+        pipeline_id=result.pipeline_id,
+        status=result.status,
+        config_diff=result.config_diff,
+        previous_config=result.previous_config,
+        new_config=result.new_config,
+        message=result.message,
+        rollback_id=result.rollback_id,
+        created_at=result.created_at,
+    )
+
+
+@router.get("/deployments", response_model=DeploymentHistoryResponse)
+async def get_deployments(
+    pipeline_id: str = Query(..., description="Pipeline ID"),
+    limit: int = Query(default=20, ge=1, le=100),
+) -> DeploymentHistoryResponse:
+    """List deployment history for a pipeline."""
+    records = _deploy_manager.get_deployment_history(pipeline_id, limit=limit)
+    return DeploymentHistoryResponse(
+        pipeline_id=pipeline_id,
+        deployments=[
+            DeploymentRecordResponse(
+                deployment_id=r.deployment_id,
+                pipeline_id=r.pipeline_id,
+                status=r.status,
+                message=r.message,
+                created_at=r.created_at,
+            )
+            for r in records
+        ],
+        total=len(records),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cost routes
+# ---------------------------------------------------------------------------
+
+
+@router.get("/costs", response_model=CostReportResponse)
+async def get_costs(
+    pipeline_id: str | None = Query(default=None),
+    model: str | None = Query(default=None),
+    user_id: str | None = Query(default=None),
+    days: int = Query(default=30, ge=1, le=365),
+    forecast_days: int = Query(default=7, ge=1, le=30),
+) -> CostReportResponse:
+    """Get cost breakdown with forecasts and anomaly detection."""
+    report = _cost_tracker.get_report(
+        pipeline_id=pipeline_id,
+        model=model,
+        user_id=user_id,
+        days=days,
+        forecast_days=forecast_days,
+    )
+    return CostReportResponse(
+        total_cost_usd=report.total_cost_usd,
+        total_entries=report.total_entries,
+        period_start=report.period_start,
+        period_end=report.period_end,
+        by_pipeline=[
+            {"label": b.label, "total_cost_usd": b.total_cost_usd, "entry_count": b.entry_count,
+             "avg_cost_usd": b.avg_cost_usd, "avg_latency_ms": b.avg_latency_ms,
+             "total_tokens": b.total_tokens}
+            for b in report.by_pipeline
+        ],
+        by_model=[
+            {"label": b.label, "total_cost_usd": b.total_cost_usd, "entry_count": b.entry_count,
+             "avg_cost_usd": b.avg_cost_usd, "avg_latency_ms": b.avg_latency_ms,
+             "total_tokens": b.total_tokens}
+            for b in report.by_model
+        ],
+        by_user=[
+            {"label": b.label, "total_cost_usd": b.total_cost_usd, "entry_count": b.entry_count,
+             "avg_cost_usd": b.avg_cost_usd, "avg_latency_ms": b.avg_latency_ms,
+             "total_tokens": b.total_tokens}
+            for b in report.by_user
+        ],
+        daily_costs=report.daily_costs,
+        forecasts=[
+            {"period_start": f.period_start, "period_end": f.period_end,
+             "projected_cost_usd": f.projected_cost_usd, "confidence": f.confidence}
+            for f in report.forecasts
+        ],
+        anomalies=[
+            {"entry_id": a.entry_id, "pipeline_id": a.pipeline_id, "model": a.model,
+             "cost_usd": a.cost_usd, "expected_cost_usd": a.expected_cost_usd,
+             "deviation_ratio": a.deviation_ratio}
+            for a in report.anomalies
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Experiment history routes
+# ---------------------------------------------------------------------------
+
+
+@router.get("/experiments", response_model=ExperimentHistoryResponse)
+async def get_experiments(
+    pipeline_id: str = Query(..., description="Pipeline ID"),
+    limit: int = Query(default=20, ge=1, le=100),
+) -> ExperimentHistoryResponse:
+    """Get experiment history for a pipeline."""
+    experiments = _experiment_tracker.get_experiment_history(pipeline_id, limit=limit)
+    return ExperimentHistoryResponse(
+        pipeline_id=pipeline_id,
+        experiments=[
+            ExperimentLogResponse(
+                experiment_id=e.experiment_id,
+                pipeline_id=e.pipeline_id,
+                run_name=e.run_name,
+                params=e.params,
+                metrics=e.metrics,
+                tags=e.tags,
+                source=e.source,
+                created_at=e.created_at,
+            )
+            for e in experiments
+        ],
+        total=len(experiments),
+    )
+
+
+@router.post("/experiments/search", response_model=ExperimentHistoryResponse)
+async def search_experiments(
+    body: ExperimentSearchRequest,
+) -> ExperimentHistoryResponse:
+    """Search experiments by metrics, tags, and date range."""
+    experiments = _experiment_tracker.search_experiments(
+        min_metrics=body.min_metrics,
+        tags=body.tags,
+        after=body.after,
+        before=body.before,
+        limit=body.limit,
+    )
+    pipeline_id = body.pipeline_id or "(all)"
+    return ExperimentHistoryResponse(
+        pipeline_id=pipeline_id,
+        experiments=[
+            ExperimentLogResponse(
+                experiment_id=e.experiment_id,
+                pipeline_id=e.pipeline_id,
+                run_name=e.run_name,
+                params=e.params,
+                metrics=e.metrics,
+                tags=e.tags,
+                source=e.source,
+                created_at=e.created_at,
+            )
+            for e in experiments
+        ],
+        total=len(experiments),
     )
