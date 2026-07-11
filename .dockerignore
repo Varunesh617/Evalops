@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+coverage*.xml
+results*.xml
+
+# Node / frontend (built separately)
+frontend/node_modules
+frontend/.next
+frontend/out
+
+# VCS & CI artifacts
+.git
+.gitignore
+*.md
+!README.md
+bandit-report.json
+safety-report.json
+
+# Local env
+.env
+.env.*
+*.db
+*.sqlite3

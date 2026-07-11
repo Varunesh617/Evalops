@@ -1,0 +1,14 @@
+node_modules
+.next
+out
+build
+npm-debug.log*
+yarn-error.log*
+.git
+.gitignore
+Dockerfile
+.dockerignore
+.env*
+coverage
+.vercel
+*.tsbuildinfo
