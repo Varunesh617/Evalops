@@ -1,5 +1,20 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
+// Health check service
+export interface HealthStatus {
+  status: "healthy" | "degraded" | "unhealthy";
+  timestamp: string;
+  version?: string;
+  uptime_seconds?: number;
+}
+
+export interface ConnectionStatus {
+  connected: boolean;
+  lastCheck: string | null;
+  lastSuccess: string | null;
+  failureCount: number;
+}
+
 // ---------------------------------------------------------------------------
 // Types matching backend schemas
 // ---------------------------------------------------------------------------
@@ -210,6 +225,92 @@ export interface PluginInstallResponse {
   signed: boolean;
 }
 
+// Diagnosis
+export interface CounterfactualResult {
+  intervention: {
+    change_type: string;
+    original_value: unknown;
+    counterfactual_value: unknown;
+    description: string;
+  };
+  counterfactual_score: number;
+  improvement_delta: number;
+  confidence: number;
+  original_step_scores: Record<string, number>;
+  counterfactual_step_scores: Record<string, number>;
+}
+
+export interface CounterfactualResponse {
+  report_id: string;
+  trace_id: string;
+  original_score: number;
+  results: CounterfactualResult[];
+  best_intervention: { change_type: string; description: string } | null;
+  best_delta: number;
+}
+
+export interface Recommendation {
+  [key: string]: unknown;
+}
+
+export interface RecommendationResponse {
+  trace_id: string;
+  recommendations: Recommendation[];
+  total: number;
+}
+
+export interface TrendDataPoint {
+  period: string;
+  count: number;
+  failure_modes: Record<string, number>;
+}
+
+export interface TrendsResponse {
+  trend: string;
+  confidence: number;
+  data_points: TrendDataPoint[];
+  total_failures: number;
+}
+
+// Cost analysis
+export interface CostBucket {
+  label: string;
+  total_cost_usd: number;
+  entry_count: number;
+  avg_cost_usd: number;
+  avg_latency_ms: number;
+  total_tokens: number;
+}
+
+export interface CostForecast {
+  period_start: string;
+  period_end: string;
+  projected_cost_usd: number;
+  confidence: number;
+}
+
+export interface CostAnomaly {
+  entry_id: string;
+  pipeline_id: string;
+  model: string;
+  cost_usd: number;
+  expected_cost_usd: number;
+  deviation_ratio: number;
+}
+
+export interface CostReport {
+  total_cost_usd: number;
+  total_entries: number;
+  period_start: string | null;
+  period_end: string | null;
+  by_pipeline: CostBucket[];
+  by_model: CostBucket[];
+  by_user: CostBucket[];
+  daily_costs: Record<string, unknown>[];
+  forecasts: CostForecast[];
+  anomalies: CostAnomaly[];
+}
+
 // ---------------------------------------------------------------------------
 // API Client
 // ---------------------------------------------------------------------------
@@ -221,16 +322,131 @@ class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json", ...options?.headers },
-    ...options,
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new ApiError(res.status, body);
+let connectionStatus: ConnectionStatus = {
+  connected: false,
+  lastCheck: null,
+  lastSuccess: null,
+  failureCount: 0,
+};
+
+let healthPollingInterval: ReturnType<typeof setInterval> | null = null;
+const healthCheckPromises: Record<string, Promise<HealthStatus>> = {};
+
+export function getConnectionStatus(): ConnectionStatus {
+  return { ...connectionStatus };
+}
+
+export function startHealthPolling(onStatusChange?: (status: ConnectionStatus) => void) {
+  if (healthPollingInterval) return;
+  
+  const updateStatus = (status: ConnectionStatus) => {
+    connectionStatus = status;
+    onStatusChange?.(status);
+  };
+  
+  const checkHealth = async () => {
+    const startTime = Date.now();
+    const controller = new AbortController();
+    
+    // Timeout after 10 seconds
+    setTimeout(() => controller.abort(), 10000);
+    
+    try {
+      const res = await fetch(`${API_BASE}/health`, { signal: controller.signal });
+      const data = await res.json();
+      
+      const timestamp = new Date().toISOString();
+      updateStatus({
+        connected: true,
+        lastCheck: timestamp,
+        lastSuccess: timestamp,
+        failureCount: 0,
+      });
+    } catch (error) {
+      const timestamp = new Date().toISOString();
+      updateStatus({
+        connected: false,
+        lastCheck: timestamp,
+        lastSuccess: connectionStatus.lastSuccess,
+        failureCount: connectionStatus.failureCount + 1,
+      });
+    }
+  };
+  
+  // Initial check
+  checkHealth();
+  
+  healthPollingInterval = setInterval(() => {
+    checkHealth();
+  }, 30000); // Poll every 30 seconds
+  
+  return () => {
+    if (healthPollingInterval) {
+      clearInterval(healthPollingInterval);
+      healthPollingInterval = null;
+    }
+  };
+}
+
+export function stopHealthPolling() {
+  if (healthPollingInterval) {
+    clearInterval(healthPollingInterval);
+    healthPollingInterval = null;
   }
-  return res.json() as Promise<T>;
+}
+
+async function request<T>(path: string, options?: RequestInit, retries = 0): Promise<T> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
+  
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      headers: { "Content-Type": "application/json", ...options?.headers },
+      ...options,
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!res.ok) {
+      throw new ApiError(res.status, await res.text());
+    }
+    
+    // Update connection status to success
+    if (connectionStatus.connected || connectionStatus.failureCount > 0) {
+      const timestamp = new Date().toISOString();
+      connectionStatus = {
+        ...connectionStatus,
+        connected: true,
+        lastCheck: timestamp,
+        lastSuccess: timestamp,
+        failureCount: 0,
+      };
+    }
+    
+    return res.json() as Promise<T>;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    
+    // Update connection status to failure
+    if (connectionStatus.connected || connectionStatus.failureCount === 0) {
+      const timestamp = new Date().toISOString();
+      connectionStatus = {
+        connected: false,
+        lastCheck: timestamp,
+        lastSuccess: connectionStatus.lastSuccess,
+        failureCount: connectionStatus.failureCount + 1,
+      };
+    }
+    
+    // Retry logic for certain errors
+    if (retries < 3 && (error instanceof ApiError ? error.status >= 500 : true)) {
+      await new Promise(resolve => setTimeout(resolve, Math.pow(2, retries) * 1000));
+      return request<T>(path, options, retries + 1);
+    }
+    
+    throw error;
+  }
 }
 
 // Pipelines
@@ -271,6 +487,8 @@ export const traces = {
 
 // Evals
 export const evals = {
+  run: (body: { trajectory_id: string; metrics: string[] }[]) =>
+    request<EvalResult>("/evals", { method: "POST", body: JSON.stringify(body) }),
   get: (id: string) => request<EvalResult>(`/evals/${id}`),
   compare: (evalA: string, evalB: string) =>
     request<EvalCompareResponse>(`/evals/compare?eval_a=${evalA}&eval_b=${evalB}`),
@@ -335,4 +553,44 @@ export const plugins = {
     }),
   uninstall: (pluginId: string) =>
     request<PluginInstallResponse>(`/plugins/${pluginId}`, { method: "DELETE" }),
+  rate: (pluginId: string, rating: number) =>
+    request<{ average: number; count: number }>(`/plugins/${pluginId}/rate`, {
+      method: "POST",
+      body: JSON.stringify({ rating }),
+    }),
+};
+
+// Diagnosis
+export const diagnosis = {
+  counterfactual: (body: { trace_id?: string; trajectory?: Record<string, unknown> }) =>
+    request<CounterfactualResponse>("/diagnosis/counterfactual", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  recommendations: (traceId: string) =>
+    request<RecommendationResponse>(`/diagnosis/recommendations/${traceId}`),
+  trends: (timeWindowDays = 30, bucketDays = 1) =>
+    request<TrendsResponse>(
+      `/diagnosis/trends?time_window_days=${timeWindowDays}&bucket_days=${bucketDays}`,
+    ),
+};
+
+// Cost analysis
+export const costs = {
+  report: (opts: {
+    pipelineId?: string;
+    model?: string;
+    userId?: string;
+    days?: number;
+    forecastDays?: number;
+  } = {}) => {
+    const params = new URLSearchParams();
+    if (opts.pipelineId) params.set("pipeline_id", opts.pipelineId);
+    if (opts.model) params.set("model", opts.model);
+    if (opts.userId) params.set("user_id", opts.userId);
+    if (opts.days !== undefined) params.set("days", String(opts.days));
+    if (opts.forecastDays !== undefined) params.set("forecast_days", String(opts.forecastDays));
+    const qs = params.toString();
+    return request<CostReport>(`/optimize/costs${qs ? `?${qs}` : ""}`);
+  },
 };

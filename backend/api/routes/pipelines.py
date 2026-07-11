@@ -22,7 +22,7 @@ from backend.api.schemas import (
 )
 from backend.core.config import PipelineConfig
 from backend.core.pipeline import PipelineExecutor
-from backend.core.tracer import TokenUsage, TrajectoryStep
+from backend.core.tracer import TrajectoryStep
 from backend.db.repositories import PipelineRepository, TraceRepository
 
 logger = structlog.get_logger(__name__)

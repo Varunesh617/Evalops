@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import structlog
 from pydantic import BaseModel, Field
 
@@ -13,8 +11,6 @@ from backend.tuning.user_preferences import (
     MetricPreference,
     OptimizationConstraints,
     OptimizationGoal,
-    OptimizationPreferences,
-    UserPreferences,
     get_domain_defaults,
 )
 

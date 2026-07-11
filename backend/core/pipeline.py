@@ -14,7 +14,7 @@ from typing import Any, Protocol, runtime_checkable
 import structlog
 
 from backend.core.config import PipelineConfig, StepStatus
-from backend.core.tracer import TokenUsage, Trajectory, Tracer
+from backend.core.tracer import TokenUsage, Tracer, Trajectory
 
 logger = structlog.get_logger(__name__)
 

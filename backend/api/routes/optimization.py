@@ -371,7 +371,13 @@ async def get_pareto_frontier(
 @router.post("/deploy", response_model=DeployResponse, status_code=201)
 async def deploy_config(body: DeployRequest) -> DeployResponse:
     """Deploy an optimized pipeline configuration."""
-    config = PipelineConfig.model_validate(body.config)
+    try:
+        config = PipelineConfig.model_validate(body.config)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid pipeline config: {exc}",
+        )
 
     candidate = _deploy_manager.evaluate_deployment_candidate(
         pipeline_id=body.pipeline_id,

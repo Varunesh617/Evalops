@@ -1,110 +1,100 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { plugins } from "@/lib/api";
 import type { PluginInfo, MarketplacePlugin } from "@/lib/api";
 
-const MOCK_INSTALLED: PluginInfo[] = [
-  {
-    plugin_id: "evalops-guardrails-core",
-    name: "Guardrails Core",
-    version: "0.2.1",
-    author: "EvalOps",
-    description: "Built-in guardrail checks for prompt injection, PII, and toxicity detection.",
-    plugin_type: "guardrail",
-    enabled: true,
-    rating: { average: 4.5, count: 28 },
-    usage: { total_checks: 15200, avg_latency_ms: 12 },
-  },
-  {
-    plugin_id: "evalops-phi-filter",
-    name: "Phi Filter",
-    version: "0.1.0",
-    author: "EvalOps",
-    description: "Medical domain safety filter using the Phi-3 model for healthcare content.",
-    plugin_type: "guardrail",
-    enabled: false,
-    rating: { average: 4.0, count: 7 },
-    usage: { total_checks: 340, avg_latency_ms: 45 },
-  },
-];
-
-const MOCK_MARKETPLACE: MarketplacePlugin[] = [
-  {
-    plugin_id: "evalops-faithfulness-scoring",
-    name: "Faithfulness Scoring",
-    version: "0.3.0",
-    summary: "Advanced faithfulness evaluation using NLI models and claim decomposition.",
-    author: "EvalOps",
-    homepage: "https://github.com/evalops/faithfulness",
-    installed: true,
-    installed_version: "0.3.0",
-    rating: 4.7,
-    rating_count: 42,
-    compatible: true,
-  },
-  {
-    plugin_id: "evalops-citation-validator",
-    name: "Citation Validator",
-    version: "0.1.2",
-    summary: "Verify that generated answers include proper citations to source documents.",
-    author: "EvalOps",
-    homepage: "https://github.com/evalops/citation-validator",
-    installed: false,
-    installed_version: "",
-    rating: 4.3,
-    rating_count: 15,
-    compatible: true,
-  },
-  {
-    plugin_id: "evalops-latency-tracker",
-    name: "Latency Tracker",
-    version: "0.2.0",
-    summary: "Detailed latency breakdown and percentile tracking for pipeline steps.",
-    author: "Community",
-    homepage: "https://github.com/community/latency-tracker",
-    installed: false,
-    installed_version: "",
-    rating: 3.9,
-    rating_count: 8,
-    compatible: true,
-  },
-  {
-    plugin_id: "evalops-cost-monitor",
-    name: "Cost Monitor",
-    version: "0.1.0",
-    summary: "Real-time cost tracking with budget alerts and usage analytics.",
-    author: "Community",
-    homepage: "",
-    installed: false,
-    installed_version: "",
-    rating: 4.1,
-    rating_count: 12,
-    compatible: true,
-  },
-];
-
 export default function PluginsPage() {
-  const [installed, setInstalled] = useState<PluginInfo[]>(MOCK_INSTALLED);
-  const [marketplace, setMarketplace] = useState<MarketplacePlugin[]>(MOCK_MARKETPLACE);
+  const [installed, setInstalled] = useState<PluginInfo[]>([]);
+  const [marketplace, setMarketplace] = useState<MarketplacePlugin[]>([]);
   const [search, setSearch] = useState("");
   const [activeTab, setActiveTab] = useState<"installed" | "browse">("installed");
 
-  const filteredMarketplace = marketplace.filter(
-    (p) =>
-      p.name.toLowerCase().includes(search.toLowerCase()) ||
-      p.summary.toLowerCase().includes(search.toLowerCase())
+  const [loadingInstalled, setLoadingInstalled] = useState(true);
+  const [loadingMarketplace, setLoadingMarketplace] = useState(true);
+  const [errorInstalled, setErrorInstalled] = useState<string | null>(null);
+  const [errorMarketplace, setErrorMarketplace] = useState<string | null>(null);
+
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+
+  const fetchInstalled = useCallback(async () => {
+    setLoadingInstalled(true);
+    setErrorInstalled(null);
+    try {
+      const res = await plugins.list();
+      setInstalled(res.plugins);
+    } catch (e: unknown) {
+      setErrorInstalled(e instanceof Error ? e.message : "Failed to load plugins");
+    } finally {
+      setLoadingInstalled(false);
+    }
+  }, []);
+
+  const fetchMarketplace = useCallback(
+    async (query?: string) => {
+      setLoadingMarketplace(true);
+      setErrorMarketplace(null);
+      try {
+        const res = await plugins.marketplace(query);
+        setMarketplace(res.plugins);
+      } catch (e: unknown) {
+        setErrorMarketplace(e instanceof Error ? e.message : "Failed to load marketplace");
+      } finally {
+        setLoadingMarketplace(false);
+      }
+    },
+    []
   );
 
-  const handleInstall = (pluginId: string) => {
-    setMarketplace((prev) =>
-      prev.map((p) =>
-        p.plugin_id === pluginId ? { ...p, installed: true } : p
-      )
-    );
+  useEffect(() => {
+    fetchInstalled();
+    fetchMarketplace();
+  }, [fetchInstalled, fetchMarketplace]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      fetchMarketplace(search || undefined);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [search, fetchMarketplace]);
+
+  const handleInstall = async (pluginId: string) => {
+    setPendingAction(pluginId);
+    try {
+      await plugins.install(pluginId);
+      await Promise.all([fetchInstalled(), fetchMarketplace(search || undefined)]);
+    } catch (e: unknown) {
+      setErrorMarketplace(e instanceof Error ? e.message : "Install failed");
+    } finally {
+      setPendingAction(null);
+    }
   };
 
-  const handleUninstall = (pluginId: string) => {
-    setInstalled((prev) => prev.filter((p) => p.plugin_id !== pluginId));
+  const handleUninstall = async (pluginId: string) => {
+    setPendingAction(pluginId);
+    try {
+      await plugins.uninstall(pluginId);
+      await Promise.all([fetchInstalled(), fetchMarketplace(search || undefined)]);
+    } catch (e: unknown) {
+      setErrorInstalled(e instanceof Error ? e.message : "Uninstall failed");
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleRate = async (pluginId: string, rating: number) => {
+    try {
+      const res = await plugins.rate(pluginId, rating);
+      setMarketplace((prev) =>
+        prev.map((p) =>
+          p.plugin_id === pluginId
+            ? { ...p, rating: res.average, rating_count: res.count }
+            : p
+        )
+      );
+    } catch {
+      // silently ignore rating failures
+    }
   };
 
   return (
@@ -136,7 +126,21 @@ export default function PluginsPage() {
 
       {activeTab === "installed" && (
         <div className="space-y-3">
-          {installed.length === 0 ? (
+          {loadingInstalled ? (
+            <div className="bg-white dark:bg-zinc-900 rounded-lg border border-zinc-200 dark:border-zinc-800 p-8 text-center">
+              <p className="text-sm text-zinc-500">Loading installed plugins...</p>
+            </div>
+          ) : errorInstalled ? (
+            <div className="bg-white dark:bg-zinc-900 rounded-lg border border-red-200 dark:border-red-800 p-8 text-center">
+              <p className="text-sm text-red-600 dark:text-red-400">{errorInstalled}</p>
+              <button
+                onClick={fetchInstalled}
+                className="mt-2 text-xs text-blue-600 dark:text-blue-400 hover:underline"
+              >
+                Retry
+              </button>
+            </div>
+          ) : installed.length === 0 ? (
             <div className="bg-white dark:bg-zinc-900 rounded-lg border border-zinc-200 dark:border-zinc-800 p-8 text-center">
               <p className="text-sm text-zinc-500">No plugins installed.</p>
             </div>
@@ -180,9 +184,10 @@ export default function PluginsPage() {
                   </div>
                   <button
                     onClick={() => handleUninstall(plugin.plugin_id)}
-                    className="ml-3 px-3 py-1.5 text-xs font-medium rounded-lg border border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/10 transition-colors"
+                    disabled={pendingAction === plugin.plugin_id}
+                    className="ml-3 px-3 py-1.5 text-xs font-medium rounded-lg border border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/10 transition-colors disabled:opacity-50"
                   >
-                    Uninstall
+                    {pendingAction === plugin.plugin_id ? "Working..." : "Uninstall"}
                   </button>
                 </div>
               </div>
@@ -201,44 +206,78 @@ export default function PluginsPage() {
             className="w-full max-w-sm px-3 py-2 text-sm border border-zinc-200 dark:border-zinc-700 rounded-lg bg-white dark:bg-zinc-900 text-zinc-900 dark:text-white placeholder:text-zinc-400"
           />
           <div className="space-y-3">
-            {filteredMarketplace.map((plugin) => (
-              <div
-                key={plugin.plugin_id}
-                className="bg-white dark:bg-zinc-900 rounded-lg border border-zinc-200 dark:border-zinc-800 p-5"
-              >
-                <div className="flex items-start justify-between">
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <h4 className="text-sm font-medium text-zinc-900 dark:text-white">
-                        {plugin.name}
-                      </h4>
-                      <span className="text-xs font-mono text-zinc-400">
-                        v{plugin.version}
-                      </span>
-                      <span className="text-xs text-zinc-400">
-                        ★ {plugin.rating.toFixed(1)} ({plugin.rating_count})
-                      </span>
-                    </div>
-                    <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-                      {plugin.summary}
-                    </p>
-                    <p className="mt-1 text-xs text-zinc-400">by {plugin.author}</p>
-                  </div>
-                  {plugin.installed ? (
-                    <span className="ml-3 px-3 py-1.5 text-xs font-medium rounded-lg bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400">
-                      Installed
-                    </span>
-                  ) : (
-                    <button
-                      onClick={() => handleInstall(plugin.plugin_id)}
-                      className="ml-3 px-3 py-1.5 text-xs font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors"
-                    >
-                      Install
-                    </button>
-                  )}
-                </div>
+            {loadingMarketplace ? (
+              <div className="bg-white dark:bg-zinc-900 rounded-lg border border-zinc-200 dark:border-zinc-800 p-8 text-center">
+                <p className="text-sm text-zinc-500">Loading marketplace...</p>
               </div>
-            ))}
+            ) : errorMarketplace ? (
+              <div className="bg-white dark:bg-zinc-900 rounded-lg border border-red-200 dark:border-red-800 p-8 text-center">
+                <p className="text-sm text-red-600 dark:text-red-400">{errorMarketplace}</p>
+                <button
+                  onClick={() => fetchMarketplace(search || undefined)}
+                  className="mt-2 text-xs text-blue-600 dark:text-blue-400 hover:underline"
+                >
+                  Retry
+                </button>
+              </div>
+            ) : marketplace.length === 0 ? (
+              <div className="bg-white dark:bg-zinc-900 rounded-lg border border-zinc-200 dark:border-zinc-800 p-8 text-center">
+                <p className="text-sm text-zinc-500">No plugins found.</p>
+              </div>
+            ) : (
+              marketplace.map((plugin) => (
+                <div
+                  key={plugin.plugin_id}
+                  className="bg-white dark:bg-zinc-900 rounded-lg border border-zinc-200 dark:border-zinc-800 p-5"
+                >
+                  <div className="flex items-start justify-between">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <h4 className="text-sm font-medium text-zinc-900 dark:text-white">
+                          {plugin.name}
+                        </h4>
+                        <span className="text-xs font-mono text-zinc-400">
+                          v{plugin.version}
+                        </span>
+                        <span className="text-xs text-zinc-400">
+                          ★ {plugin.rating.toFixed(1)} ({plugin.rating_count})
+                        </span>
+                      </div>
+                      <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                        {plugin.summary}
+                      </p>
+                      <p className="mt-1 text-xs text-zinc-400">by {plugin.author}</p>
+                      <div className="mt-2 flex items-center gap-1">
+                        {[1, 2, 3, 4, 5].map((star) => (
+                          <button
+                            key={star}
+                            onClick={() => handleRate(plugin.plugin_id, star)}
+                            className="text-sm text-zinc-300 dark:text-zinc-600 hover:text-amber-400 dark:hover:text-amber-400 transition-colors"
+                            title={`Rate ${star} star${star !== 1 ? "s" : ""}`}
+                          >
+                            ★
+                          </button>
+                        ))}
+                        <span className="ml-1 text-xs text-zinc-400">Rate</span>
+                      </div>
+                    </div>
+                    {plugin.installed ? (
+                      <span className="ml-3 px-3 py-1.5 text-xs font-medium rounded-lg bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400">
+                        Installed
+                      </span>
+                    ) : (
+                      <button
+                        onClick={() => handleInstall(plugin.plugin_id)}
+                        disabled={pendingAction === plugin.plugin_id}
+                        className="ml-3 px-3 py-1.5 text-xs font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors disabled:opacity-50"
+                      >
+                        {pendingAction === plugin.plugin_id ? "Installing..." : "Install"}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))
+            )}
           </div>
         </>
       )}

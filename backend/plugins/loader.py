@@ -14,6 +14,7 @@ from typing import Any
 import structlog
 
 from backend.plugins.sdk import PluginBase
+from backend.plugins.security import PluginSandbox, PluginSecurityError
 
 logger = structlog.get_logger(__name__)
 
@@ -33,10 +34,16 @@ class VersionConflict(PluginLoadError):
 class PluginLoader:
     """Discovers and instantiates EvalOps plugins from multiple sources."""
 
-    def __init__(self, *, extra_dirs: list[str | Path] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        extra_dirs: list[str | Path] | None = None,
+        sandbox: PluginSandbox | None = None,
+    ) -> None:
         self._extra_dirs = [Path(d) for d in (extra_dirs or [])]
         self._hot_reload_watches: dict[str, float] = {}
         self._loaded_modules: dict[str, types.ModuleType] = {}
+        self._sandbox = sandbox
 
     # ------------------------------------------------------------------
     # Entry-point loading (setuptools / pyproject.toml)
@@ -60,10 +67,24 @@ class PluginLoader:
 
     def _load_entry_point(self, ep: importlib.metadata.EntryPoint) -> PluginBase:
         try:
-            cls = ep.load()
+            if self._sandbox is not None:
+                with self._sandbox.timed_execution(ep.name):
+                    cls = ep.load()
+            else:
+                cls = ep.load()
+        except PluginSecurityError:
+            raise
         except Exception as exc:
             raise PluginLoadError(f"Failed to load entry point '{ep.name}': {exc}") from exc
-        return self._instantiate_plugin(cls, source=f"entry_point:{ep.name}")
+
+        plugin = self._instantiate_plugin(cls, source=f"entry_point:{ep.name}")
+
+        if self._sandbox is not None:
+            cls_module = inspect.getmodule(cls)
+            if cls_module is not None:
+                self._sandbox.enforce_imports(cls_module)
+
+        return plugin
 
     # ------------------------------------------------------------------
     # Directory loading
@@ -95,6 +116,9 @@ class PluginLoader:
         return plugins
 
     def _load_module_from_path(self, path: Path) -> dict[str, PluginBase]:
+        if self._sandbox is not None:
+            self._sandbox.validate_path(path)
+
         module_name = f"evalops_plugin_{path.stem}"
         spec = importlib.util.spec_from_file_location(module_name, path)
         if spec is None or spec.loader is None:
@@ -103,9 +127,18 @@ class PluginLoader:
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
         try:
-            spec.loader.exec_module(module)  # type: ignore[union-attr]
+            if self._sandbox is not None:
+                with self._sandbox.timed_execution(module_name):
+                    spec.loader.exec_module(module)  # type: ignore[union-attr]
+            else:
+                spec.loader.exec_module(module)  # type: ignore[union-attr]
+        except PluginSecurityError:
+            raise
         except Exception as exc:
             raise PluginLoadError(f"Module execution failed for {path}: {exc}") from exc
+
+        if self._sandbox is not None:
+            self._sandbox.enforce_imports(module)
 
         self._loaded_modules[module_name] = module
         return self._discover_plugins_in_module(module, source=str(path))
@@ -219,6 +252,9 @@ class PluginLoader:
     def _discover_plugins_in_module(
         self, module: types.ModuleType, *, source: str = "unknown"
     ) -> dict[str, PluginBase]:
+        if self._sandbox is not None:
+            self._sandbox.enforce_imports(module)
+
         plugins: dict[str, PluginBase] = {}
         for attr_name in dir(module):
             obj = getattr(module, attr_name)

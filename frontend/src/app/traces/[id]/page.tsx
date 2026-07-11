@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
+import { traces } from "@/lib/api";
 import type { Trace, BlameAttribution } from "@/lib/api";
 import TraceTimeline from "@/components/TraceTimeline";
 import BlameWaterfall from "@/components/BlameWaterfall";
@@ -16,17 +17,14 @@ export default function TraceDetailPage() {
   useEffect(() => {
     async function load() {
       try {
-        const trRes = await fetch(`http://localhost:8000/traces/${id}`);
-        if (trRes.ok) {
-          const data = await trRes.json();
-          setTrace(data);
-          if (data.status === "failed") {
-            try {
-              const blRes = await fetch(`http://localhost:8000/traces/${id}/blame`);
-              if (blRes.ok) setBlame(await blRes.json());
-            } catch {
-              // blame unavailable
-            }
+        const data = await traces.get(id);
+        setTrace(data);
+        if (data.status === "failed") {
+          try {
+            const blameData = await traces.blame(id);
+            setBlame(blameData);
+          } catch {
+            // blame unavailable
           }
         }
       } catch {

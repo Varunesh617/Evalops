@@ -18,14 +18,12 @@ from backend.core.tracer import (
     TrajectoryStep,
 )
 from backend.db.repositories import TraceRepository
-from backend.diagnosis.counterfactual import CounterfactualEngine, CounterfactualReport
+from backend.diagnosis.counterfactual import CounterfactualEngine
 from backend.diagnosis.historical_analyzer import (
     FailureRecord,
     HistoricalAnalyzer,
-    HistoricalReport,
-    TrendDirection,
 )
-from backend.diagnosis.recommender import RecommendationEngine, RecommendationReport
+from backend.diagnosis.recommender import RecommendationEngine
 from backend.eval.blame_attribution import BlameAttributionEngine
 
 logger = structlog.get_logger(__name__)

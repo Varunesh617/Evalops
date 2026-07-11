@@ -106,7 +106,7 @@ async def trace_stream(
     try:
         raw = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
         subscription = json.loads(raw)
-    except (asyncio.TimeoutError, json.JSONDecodeError):
+    except (TimeoutError, json.JSONDecodeError):
         subscription = {}
 
     await manager.connect(ws, subscription)

@@ -1,74 +1,160 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { MetricPreference, FilterPreference, UserPreferences, TuningPreset } from "@/lib/api";
+import {
+  tuning,
+  type MetricPreference,
+  type FilterPreference,
+  type TuningPreset,
+  type UserPreferences,
+} from "@/lib/api";
 import MetricSelector from "@/components/MetricSelector";
 import FilterConfig from "@/components/FilterConfig";
 import PresetManager from "@/components/PresetManager";
 
-const DEFAULT_METRICS: MetricPreference[] = [
-  { name: "faithfulness", enabled: true, weight: 1.0 },
-  { name: "context_relevance", enabled: true, weight: 1.0 },
-  { name: "trajectory_coherence", enabled: true, weight: 1.0 },
-  { name: "tool_call_accuracy", enabled: true, weight: 1.0 },
-  { name: "guardrail_fp_rate", enabled: false, weight: 0.5 },
-  { name: "cost_efficiency", enabled: true, weight: 1.0 },
-];
-
-const DEFAULT_FILTERS: FilterPreference[] = [
-  { name: "prompt_injection", enabled: true, threshold: 0.5, priority: 100 },
-  { name: "pii", enabled: true, threshold: 0.6, priority: 90 },
-  { name: "toxicity", enabled: true, threshold: 0.5, priority: 80 },
-  { name: "faithfulness_check", enabled: false, threshold: 0.5, priority: 50 },
-  { name: "citation_validator", enabled: false, threshold: 0.5, priority: 40 },
-];
-
-const MOCK_PRESETS: TuningPreset[] = [
-  {
-    preset_id: "builtin-healthcare",
-    name: "Healthcare",
-    description: "High-faithfulness configuration for medical Q&A with strict guardrails.",
-    domain: "healthcare",
-    preferences: {} as UserPreferences,
-    is_builtin: true,
-  },
-  {
-    preset_id: "builtin-finance",
-    name: "Finance",
-    description: "Balanced cost/quality for financial document analysis.",
-    domain: "finance",
-    preferences: {} as UserPreferences,
-    is_builtin: true,
-  },
-  {
-    preset_id: "builtin-general",
-    name: "General Purpose",
-    description: "Default settings suitable for most use cases.",
-    domain: "general",
-    preferences: {} as UserPreferences,
-    is_builtin: true,
-  },
-];
-
-const SMART_DEFAULTS = {
-  recommendations: [
-    { setting: "retrieval_top_k", suggested: 10, reason: "Based on avg query complexity" },
-    { setting: "reranker_model", suggested: "cross-encoder", reason: "Best quality/cost ratio" },
-    { setting: "temperature", suggested: 0.3, reason: "Low hallucination target" },
-    { setting: "guardrails", suggested: "enabled", reason: "High-stakes domain detected" },
-  ],
-};
+interface SmartDefault {
+  setting: string;
+  suggested: string | number;
+  reason: string;
+}
 
 export default function TuningPage() {
-  const [metrics, setMetrics] = useState<MetricPreference[]>(DEFAULT_METRICS);
-  const [filters, setFilters] = useState<FilterPreference[]>(DEFAULT_FILTERS);
+  const [metrics, setMetrics] = useState<MetricPreference[]>([]);
+  const [filters, setFilters] = useState<FilterPreference[]>([]);
+  const [presets, setPresets] = useState<TuningPreset[]>([]);
+  const [smartDefaults, setSmartDefaults] = useState<SmartDefault[]>([]);
   const [activePresetId, setActivePresetId] = useState<string | null>(null);
+  const [preferences, setPreferences] = useState<UserPreferences | null>(null);
   const [activeTab, setActiveTab] = useState<"metrics" | "filters" | "presets" | "defaults">("metrics");
 
-  const handleApplyPreset = (presetId: string) => {
-    setActivePresetId(presetId);
-    // In production: fetch preset, update metrics/filters
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveMessage, setSaveMessage] = useState<string | null>(null);
+
+  const clearSaveMessage = () => setTimeout(() => setSaveMessage(null), 3000);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function load() {
+      try {
+        setLoading(true);
+        setError(null);
+
+        const [prefs, presetList, defaults] = await Promise.all([
+          tuning.getPreferences(),
+          tuning.listPresets(),
+          tuning.getSmartDefaults(),
+        ]);
+
+        if (cancelled) return;
+
+        setPreferences(prefs);
+        setMetrics(prefs.metrics);
+        setFilters(prefs.filters);
+        setPresets(presetList);
+
+        const recs = (defaults as Record<string, unknown>).recommendations as
+          | SmartDefault[]
+          | undefined;
+        setSmartDefaults(recs ?? []);
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : "Failed to load tuning data");
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    load();
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleSaveMetrics = async () => {
+    try {
+      setSaving(true);
+      setError(null);
+      const res = await tuning.configureMetrics("default", metrics);
+      setPreferences(res.preferences);
+      setSaveMessage("Metric config saved");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to save metrics");
+    } finally {
+      setSaving(false);
+    }
   };
+
+  const handleSaveFilters = async () => {
+    try {
+      setSaving(true);
+      setError(null);
+      const res = await tuning.configureFilters("default", filters);
+      setPreferences(res.preferences);
+      setSaveMessage("Filter config saved");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to save filters");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleApplyPreset = async (presetId: string) => {
+    try {
+      setSaving(true);
+      setError(null);
+      const res = await tuning.applyPreset(presetId);
+      setActivePresetId(presetId);
+      setPreferences(res.preferences);
+      setMetrics(res.preferences.metrics);
+      setFilters(res.preferences.filters);
+      setSaveMessage(`Preset "${presets.find((p) => p.preset_id === presetId)?.name ?? presetId}" applied`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to apply preset");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleApplySmartDefault = async (rec: SmartDefault) => {
+    if (!preferences) return;
+    try {
+      setSaving(true);
+      setError(null);
+      const updated: UserPreferences = {
+        ...preferences,
+        optimization: {
+          ...preferences.optimization,
+          [rec.setting]: rec.suggested,
+        },
+      };
+      const res = await tuning.updatePreferences(updated);
+      setPreferences(res);
+      setSaveMessage(`${rec.setting} updated to ${String(rec.suggested)}`);
+      setTimeout(clearSaveMessage, 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to apply recommendation");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="space-y-6">
+        <div>
+          <h2 className="text-2xl font-bold text-zinc-900 dark:text-white">Tuning</h2>
+          <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-1">
+            Configure metrics, filters, and optimization preferences
+          </p>
+        </div>
+        <div className="flex items-center justify-center py-12">
+          <div className="text-sm text-zinc-500 dark:text-zinc-400">Loading tuning configuration…</div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -80,6 +166,18 @@ export default function TuningPage() {
           Configure metrics, filters, and optimization preferences
         </p>
       </div>
+
+      {error && (
+        <div className="px-4 py-3 text-sm rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-400">
+          {error}
+        </div>
+      )}
+
+      {saveMessage && (
+        <div className="px-4 py-3 text-sm rounded-lg bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400">
+          {saveMessage}
+        </div>
+      )}
 
       <div className="flex items-center gap-1 bg-zinc-100 dark:bg-zinc-800 rounded-lg p-1 w-fit">
         {(["metrics", "filters", "presets", "defaults"] as const).map((tab) => (
@@ -107,8 +205,12 @@ export default function TuningPage() {
           </p>
           <MetricSelector metrics={metrics} onChange={setMetrics} />
           <div className="mt-4 flex justify-end">
-            <button className="px-4 py-2 text-sm font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors">
-              Save Metric Config
+            <button
+              onClick={handleSaveMetrics}
+              disabled={saving}
+              className="px-4 py-2 text-sm font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors disabled:opacity-50"
+            >
+              {saving ? "Saving…" : "Save Metric Config"}
             </button>
           </div>
         </div>
@@ -124,8 +226,12 @@ export default function TuningPage() {
           </p>
           <FilterConfig filters={filters} onChange={setFilters} />
           <div className="mt-4 flex justify-end">
-            <button className="px-4 py-2 text-sm font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors">
-              Save Filter Config
+            <button
+              onClick={handleSaveFilters}
+              disabled={saving}
+              className="px-4 py-2 text-sm font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors disabled:opacity-50"
+            >
+              {saving ? "Saving…" : "Save Filter Config"}
             </button>
           </div>
         </div>
@@ -140,7 +246,7 @@ export default function TuningPage() {
             Apply pre-configured tuning profiles or create your own.
           </p>
           <PresetManager
-            presets={MOCK_PRESETS}
+            presets={presets}
             activePresetId={activePresetId}
             onApply={handleApplyPreset}
           />
@@ -156,7 +262,7 @@ export default function TuningPage() {
             AI-powered configuration recommendations based on your usage patterns.
           </p>
           <div className="space-y-3">
-            {SMART_DEFAULTS.recommendations.map((rec) => (
+            {smartDefaults.map((rec) => (
               <div
                 key={rec.setting}
                 className="flex items-center justify-between p-4 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-800/50"
@@ -171,12 +277,21 @@ export default function TuningPage() {
                   <span className="text-sm font-medium text-emerald-600 dark:text-emerald-400 font-mono">
                     {String(rec.suggested)}
                   </span>
-                  <button className="px-2 py-1 text-xs font-medium rounded bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-200 dark:hover:bg-emerald-900/50 transition-colors">
-                    Apply
+                  <button
+                    onClick={() => handleApplySmartDefault(rec)}
+                    disabled={saving || !preferences}
+                    className="px-2 py-1 text-xs font-medium rounded bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-200 dark:hover:bg-emerald-900/50 transition-colors disabled:opacity-50"
+                  >
+                    {saving ? "…" : "Apply"}
                   </button>
                 </div>
               </div>
             ))}
+            {smartDefaults.length === 0 && (
+              <p className="text-sm text-zinc-500 dark:text-zinc-400 text-center py-4">
+                No recommendations available for your current usage patterns.
+              </p>
+            )}
           </div>
         </div>
       )}

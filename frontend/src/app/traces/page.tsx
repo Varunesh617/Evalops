@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
+import { traces } from "@/lib/api";
 import type { Trace } from "@/lib/api";
 
 const STATUS_STYLES: Record<string, string> = {
@@ -10,6 +12,8 @@ const STATUS_STYLES: Record<string, string> = {
   failed: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400",
 };
 
+const PAGE_SIZE = 50;
+
 export default function TracesPage() {
   const [traceList, setTraceList] = useState<Trace[]>([]);
   const [loading, setLoading] = useState(true);
@@ -17,20 +21,26 @@ export default function TracesPage() {
   const [statusFilter, setStatusFilter] = useState("");
   const [minCost, setMinCost] = useState("");
   const [maxCost, setMaxCost] = useState("");
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+
+  useEffect(() => {
+    setPage(1);
+  }, [pipelineFilter, statusFilter, minCost, maxCost]);
 
   useEffect(() => {
     async function load() {
       try {
-        const params = new URLSearchParams({ page: "1", page_size: "50" });
-        if (pipelineFilter) params.set("pipeline_id", pipelineFilter);
-        if (statusFilter) params.set("status", statusFilter);
-        if (minCost) params.set("min_cost", minCost);
-        if (maxCost) params.set("max_cost", maxCost);
-        const res = await fetch(`http://localhost:8000/traces?${params}`);
-        if (res.ok) {
-          const data = await res.json();
-          setTraceList(data.traces ?? []);
-        }
+        const data = await traces.list(
+          page,
+          PAGE_SIZE,
+          pipelineFilter || undefined,
+          statusFilter || undefined,
+          minCost ? Number(minCost) : undefined,
+          maxCost ? Number(maxCost) : undefined,
+        );
+        setTraceList(data.traces ?? []);
+        setTotal(data.total);
       } catch {
         // API not available
       } finally {
@@ -38,7 +48,9 @@ export default function TracesPage() {
       }
     }
     load();
-  }, [pipelineFilter, statusFilter, minCost, maxCost]);
+  }, [page, pipelineFilter, statusFilter, minCost, maxCost]);
+
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   return (
     <div className="space-y-6">
@@ -129,15 +141,14 @@ export default function TracesPage() {
               </tr>
             ) : (
               traceList.map((t) => (
-                <tr
-                  key={t.id}
-                  className="hover:bg-zinc-50 dark:hover:bg-zinc-800/50 transition-colors cursor-pointer"
-                  onClick={() => (window.location.href = `/traces/${t.id}`)}
-                >
+                <tr key={t.id} className="hover:bg-zinc-50 dark:hover:bg-zinc-800/50 transition-colors">
                   <td className="px-6 py-4">
-                    <span className="text-sm font-medium text-blue-600 dark:text-blue-400 font-mono">
+                    <Link
+                      href={`/traces/${t.id}`}
+                      className="text-sm font-medium text-blue-600 dark:text-blue-400 font-mono hover:underline"
+                    >
                       {t.id}
-                    </span>
+                    </Link>
                   </td>
                   <td className="px-6 py-4 text-sm text-zinc-600 dark:text-zinc-400 font-mono">
                     {t.pipeline_id}
@@ -164,6 +175,28 @@ export default function TracesPage() {
           </tbody>
         </table>
       </div>
+
+      {total > PAGE_SIZE && (
+        <div className="flex items-center justify-between">
+          <button
+            onClick={() => setPage((p) => Math.max(1, p - 1))}
+            disabled={page <= 1}
+            className="px-4 py-2 text-sm font-medium rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Previous
+          </button>
+          <span className="text-sm text-zinc-500 dark:text-zinc-400">
+            Page {page} of {totalPages}
+          </span>
+          <button
+            onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+            disabled={page >= totalPages}
+            className="px-4 py-2 text-sm font-medium rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Next
+          </button>
+        </div>
+      )}
     </div>
   );
 }

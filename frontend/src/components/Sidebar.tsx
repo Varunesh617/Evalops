@@ -9,12 +9,18 @@ const NAV_ITEMS = [
   { href: "/traces", label: "Traces", icon: "🔍" },
   { href: "/evals", label: "Evaluations", icon: "✅" },
   { href: "/optimization", label: "Optimization", icon: "⚡" },
+  { href: "/diagnosis", label: "Diagnosis", icon: "🩺" },
+  { href: "/cost-analysis", label: "Cost Analysis", icon: "💰" },
   { href: "/tuning", label: "Tuning", icon: "🎛" },
   { href: "/plugins", label: "Plugins", icon: "🧩" },
 ];
 
-export default function Sidebar() {
+export default function Sidebar({ onNavigate }: { onNavigate?: () => void } = {}) {
   const pathname = usePathname();
+
+  const handleNavigate = () => {
+    if (onNavigate) onNavigate();
+  };
 
   return (
     <aside className="hidden lg:flex lg:flex-col lg:w-64 bg-zinc-900 text-zinc-300 border-r border-zinc-800">
@@ -36,6 +42,7 @@ export default function Sidebar() {
                   ? "bg-zinc-800 text-white"
                   : "text-zinc-400 hover:bg-zinc-800/50 hover:text-white"
               }`}
+              onClick={handleNavigate}
             >
               <span className="text-base">{item.icon}</span>
               {item.label}

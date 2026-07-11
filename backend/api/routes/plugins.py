@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from typing import Any
 
 import structlog
@@ -16,46 +17,68 @@ from backend.plugins.registry import PluginRegistry
 from backend.plugins.security import (
     PluginSandbox,
     PluginSecurityError,
-    PluginSignatureMissing,
 )
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/plugins", tags=["plugins"])
 
-# ---------------------------------------------------------------------------
-# Singleton instances — created once, served via DI providers
-# ---------------------------------------------------------------------------
-
-_registry = PluginRegistry()
-_loader = PluginLoader()
-_discovery = PluginDiscovery()
-_marketplace = PluginMarketplace(_registry, _loader, _discovery)
-_sandbox = PluginSandbox()
-
 
 # ---------------------------------------------------------------------------
-# DI providers (Fix C1: replaces bare module-level references in routes)
+# Lazy singleton factories — instances created on first call, then cached
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=1)
+def _get_plugin_registry_singleton() -> PluginRegistry:
+    return PluginRegistry()
+
+
+@lru_cache(maxsize=1)
+def _get_plugin_loader_singleton() -> PluginLoader:
+    return PluginLoader()
+
+
+@lru_cache(maxsize=1)
+def _get_plugin_discovery_singleton() -> PluginDiscovery:
+    return PluginDiscovery()
+
+
+@lru_cache(maxsize=1)
+def _get_plugin_marketplace_singleton() -> PluginMarketplace:
+    registry = _get_plugin_registry_singleton()
+    loader = _get_plugin_loader_singleton()
+    discovery = _get_plugin_discovery_singleton()
+    return PluginMarketplace(registry, loader, discovery)
+
+
+@lru_cache(maxsize=1)
+def _get_plugin_sandbox_singleton() -> PluginSandbox:
+    return PluginSandbox()
+
+
+# ---------------------------------------------------------------------------
+# DI providers (return the lazily-created singletons)
 # ---------------------------------------------------------------------------
 
 
 def get_plugin_registry() -> PluginRegistry:
     """FastAPI dependency — return the shared PluginRegistry singleton."""
-    return _registry
+    return _get_plugin_registry_singleton()
 
 
 def get_plugin_loader() -> PluginLoader:
     """FastAPI dependency — return the shared PluginLoader singleton."""
-    return _loader
+    return _get_plugin_loader_singleton()
 
 
 def get_plugin_marketplace() -> PluginMarketplace:
     """FastAPI dependency — return the shared PluginMarketplace singleton."""
-    return _marketplace
+    return _get_plugin_marketplace_singleton()
 
 
 def get_plugin_sandbox() -> PluginSandbox:
     """FastAPI dependency — return the shared PluginSandbox singleton."""
-    return _sandbox
+    return _get_plugin_sandbox_singleton()
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +291,17 @@ async def get_plugin(
     info = marketplace.get_plugin_info(plugin_id)
     if info is None:
         raise HTTPException(status_code=404, detail=f"Plugin '{plugin_id}' not found")
-    return PluginInfoResponse(**{k: info[k] for k in PluginInfoResponse.model_fields})
+    return PluginInfoResponse(
+        plugin_id=info["plugin_id"],
+        name=info["name"],
+        version=info["version"],
+        author=info.get("author", ""),
+        description=info.get("description", ""),
+        plugin_type=info.get("plugin_type", ""),
+        enabled=info.get("enabled", True),
+        rating=info.get("rating", {}),
+        usage=info.get("usage", {}),
+    )
 
 
 # ---------------------------------------------------------------------------

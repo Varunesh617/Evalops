@@ -7,7 +7,6 @@ to produce prioritised, actionable recommendations with implementation snippets.
 from __future__ import annotations
 
 import enum
-import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -434,9 +433,7 @@ class RecommendationEngine:
 
             # Boost if counterfactual confirms this category helps
             if counterfactual_delta is not None and counterfactual_delta > 0.1:
-                if rule.category == RecommendationCategory.RETRIEVAL and "retrieve" in blame.root_cause_step:
-                    priority += 10
-                elif rule.category == RecommendationCategory.REASONING and "reason" in blame.root_cause_step:
+                if rule.category == RecommendationCategory.RETRIEVAL and "retrieve" in blame.root_cause_step or rule.category == RecommendationCategory.REASONING and "reason" in blame.root_cause_step:
                     priority += 10
 
             matched.append(

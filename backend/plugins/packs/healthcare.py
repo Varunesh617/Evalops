@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
 
-from backend.eval.models import MetricResult, Step, StepScore, Trajectory
+from backend.eval.models import Step, Trajectory
 from backend.guardrails.filters.base import (
-    BaseFilter,
     FilterDecision,
     FilterResult,
     RiskLevel,
@@ -190,9 +188,7 @@ class PHIDetectionFilter(FilterPlugin):
         severity = len(phi_matches) / len(_PHI_PATTERNS)
         score = min(1.0, severity * 2)
 
-        if self._strict:
-            decision = FilterDecision.BLOCK
-        elif score >= self._threshold:
+        if self._strict or score >= self._threshold:
             decision = FilterDecision.BLOCK
         elif score >= self._threshold * 0.7:
             decision = FilterDecision.WARN

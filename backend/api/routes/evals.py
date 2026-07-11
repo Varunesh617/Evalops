@@ -15,10 +15,10 @@ from backend.api.schemas import (
     EvalResultResponse,
     EvalRunRequest,
 )
+from backend.db.repositories import EvalRepository
 from backend.eval.engine import EvalEngine
 from backend.eval.metrics import METRIC_REGISTRY
 from backend.eval.models import Trajectory as EvalTrajectory
-from backend.db.repositories import EvalRepository
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/evals", tags=["evals"])
@@ -103,18 +103,6 @@ async def run_eval(
     return EvalResultResponse(**record)
 
 
-@router.get("/{eval_id}", response_model=EvalResultResponse)
-async def get_eval(
-    eval_id: str,
-    eval_repo: Annotated[EvalRepository, Depends(get_eval_repository)],
-) -> EvalResultResponse:
-    """Retrieve a single evaluation result from the DB."""
-    record = await eval_repo.get(eval_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail=f"Eval {eval_id} not found")
-    return EvalResultResponse(**record)
-
-
 @router.get("/compare", response_model=EvalCompareResponse)
 async def compare_evals(
     eval_repo: Annotated[EvalRepository, Depends(get_eval_repository)],
@@ -152,3 +140,15 @@ async def compare_evals(
         score_diffs=diffs,
         winner=winner,
     )
+
+
+@router.get("/{eval_id}", response_model=EvalResultResponse)
+async def get_eval(
+    eval_id: str,
+    eval_repo: Annotated[EvalRepository, Depends(get_eval_repository)],
+) -> EvalResultResponse:
+    """Retrieve a single evaluation result from the DB."""
+    record = await eval_repo.get(eval_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Eval {eval_id} not found")
+    return EvalResultResponse(**record)

@@ -9,7 +9,6 @@ from typing import Any
 from backend.eval.models import MetricResult, Step, Trajectory
 from backend.guardrails.filters.base import BaseFilter, FilterResult
 
-
 # ---------------------------------------------------------------------------
 # Core plugin base
 # ---------------------------------------------------------------------------
@@ -111,9 +110,7 @@ class MetricPlugin(PluginBase):
             score = BaseMetric.clamp(self.score_step(trajectory, step))
             scores.append(score)
             step_scores.append(
-                Step(step_id=step.step_id, step_type=step.step_type)  # type: ignore[arg-type]
-                if False
-                else _make_step_score(step.step_id, self.plugin_id, score)
+                _make_step_score(step.step_id, self.plugin_id, score)
             )
         overall = BaseMetric.clamp(self.aggregate_steps(scores))
         return MetricResult(

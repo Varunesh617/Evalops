@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useParams } from "next/navigation";
+import { pipelines } from "@/lib/api";
 import type { Pipeline, Trace } from "@/lib/api";
 
 const STATUS_STYLES: Record<string, string> = {
@@ -18,24 +19,48 @@ export default function PipelineDetailPage() {
   const [pipeline, setPipeline] = useState<Pipeline | null>(null);
   const [traces, setTraces] = useState<Trace[]>([]);
   const [loading, setLoading] = useState(true);
+  const [running, setRunning] = useState(false);
+  const [runStatus, setRunStatus] = useState<{ ok: boolean; message: string } | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const [pl, tr] = await Promise.allSettled([
+        pipelines.get(id),
+        pipelines.traces(id),
+      ]);
+      if (pl.status === "fulfilled") setPipeline(pl.value);
+      if (tr.status === "fulfilled") setTraces(tr.value.traces ?? []);
+    } catch {
+      // API not available
+    } finally {
+      setLoading(false);
+    }
+  }, [id]);
 
   useEffect(() => {
-    async function load() {
-      try {
-        const [plRes, trRes] = await Promise.allSettled([
-          fetch(`http://localhost:8000/pipelines/${id}`).then((r) => r.json()),
-          fetch(`http://localhost:8000/pipelines/${id}/traces?page=1&page_size=20`).then((r) => r.json()),
-        ]);
-        if (plRes.status === "fulfilled") setPipeline(plRes.value);
-        if (trRes.status === "fulfilled") setTraces(trRes.value.traces ?? []);
-      } catch {
-        // API not available
-      } finally {
-        setLoading(false);
-      }
-    }
     load();
-  }, [id]);
+  }, [load]);
+
+  const handleRun = async () => {
+    setRunning(true);
+    setRunStatus(null);
+    try {
+      const result = await pipelines.run(id);
+      setRunStatus({ ok: true, message: `Run started (${result.run_id}). Status: ${result.status}` });
+      setTimeout(async () => {
+        try {
+          const tr = await pipelines.traces(id);
+          setTraces(tr.traces ?? []);
+        } catch {
+          // ignore
+        }
+      }, 2000);
+    } catch (err) {
+      setRunStatus({ ok: false, message: err instanceof Error ? err.message : "Failed to run pipeline" });
+    } finally {
+      setRunning(false);
+    }
+  };
 
   if (loading) {
     return <p className="text-sm text-zinc-500">Loading pipeline...</p>;
@@ -75,9 +100,26 @@ export default function PipelineDetailPage() {
             ))}
           </div>
         </div>
-        <button className="px-4 py-2 text-sm font-medium rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 transition-colors">
-          Run Pipeline
-        </button>
+        <div className="flex flex-col items-end gap-2">
+          <button
+            onClick={handleRun}
+            disabled={running}
+            className="px-4 py-2 text-sm font-medium rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 transition-colors disabled:opacity-50"
+          >
+            {running ? "Running..." : "Run Pipeline"}
+          </button>
+          {runStatus && (
+            <p
+              className={`text-xs ${
+                runStatus.ok
+                  ? "text-emerald-600 dark:text-emerald-400"
+                  : "text-red-600 dark:text-red-400"
+              }`}
+            >
+              {runStatus.message}
+            </p>
+          )}
+        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

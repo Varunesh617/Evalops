@@ -12,7 +12,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-from .base import BaseFilter, FilterDecision, FilterResult, RiskLevel
+from .base import BaseFilter, FilterResult
 
 
 @dataclass(frozen=True, slots=True)

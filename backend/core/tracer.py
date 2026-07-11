@@ -7,14 +7,14 @@ integrates with OpenTelemetry via bridge adapters.
 
 from __future__ import annotations
 
+import random
 import re
 import time
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncIterator
-
-import random
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -176,6 +176,9 @@ class Trajectory:
     def finalise(self) -> None:
         """Mark trajectory as complete and compute aggregates."""
         self.end_time = time.monotonic()
+        self.total_tokens = TokenUsage()
+        for step in self.steps:
+            self.total_tokens = self.total_tokens + step.tokens
 
     @property
     def latency_ms(self) -> float | None:

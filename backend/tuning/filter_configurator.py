@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from backend.guardrails.filters import (
     BaseFilter,
@@ -135,6 +135,8 @@ class FilterConfigurator:
         for text in sample_inputs:
             input_results: list[dict[str, Any]] = []
             for f in instances:
+                if not f.enabled:
+                    continue
                 result = f.check(text)
                 input_results.append({
                     "filter": result.filter_name,

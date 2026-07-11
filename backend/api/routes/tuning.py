@@ -10,16 +10,15 @@ from fastapi import APIRouter, HTTPException
 from backend.tuning.config_schema import ConfigSchemaGenerator
 from backend.tuning.filter_configurator import FilterConfigurator
 from backend.tuning.metric_selector import MetricSelector
-from backend.tuning.optimization_config import OptimizationConfigurator, SearchSpaceConfig
-from backend.tuning.preset_manager import PresetManager, TuningPreset
-from backend.tuning.smart_defaults import SmartDefaults, PipelineUsageStats
+from backend.tuning.optimization_config import OptimizationConfigurator
+from backend.tuning.preset_manager import PresetManager
+from backend.tuning.smart_defaults import PipelineUsageStats, SmartDefaults
 from backend.tuning.user_preferences import (
     DomainType,
     FilterPreference,
     MetricPreference,
     OptimizationConstraints,
     OptimizationGoal,
-    OptimizationPreferences,
     UserPreferences,
     UserPreferencesManager,
 )

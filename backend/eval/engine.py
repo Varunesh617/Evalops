@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Sequence
+from collections.abc import Sequence
 
 import structlog
 

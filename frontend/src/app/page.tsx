@@ -1,45 +1,88 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import MetricCard from "@/components/MetricCard";
-
-interface DashboardStats {
-  pipelines: number;
-  traces: number;
-  evals: number;
-  totalCost: number;
-}
+import { useError } from "@/lib/error-context";
+import useHealthCheck from "@/hooks/useHealthCheck";
+import { CardSkeleton } from "@/components/LoadingSkeleton";
+import { pipelines as pipelinesApi, traces as tracesApi } from "@/lib/api";
+import type { Trace } from "@/lib/api";
 
 export default function DashboardPage() {
-  const [stats, setStats] = useState<DashboardStats>({
+  const { showToast } = useError();
+  const { status } = useHealthCheck();
+
+  const [stats, setStats] = useState({
     pipelines: 0,
     traces: 0,
     evals: 0,
     totalCost: 0,
   });
+  const [recentTraces, setRecentTraces] = useState<Trace[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // Update error context when error changes
+  useEffect(() => {
+    if (error) {
+      setError(null); // This would be handled differently in real implementation
+    }
+  }, [error]);
+
+  // Update error when connection status changes
+  useEffect(() => {
+    if (!status.connected) {
+      showToast("API disconnected", "error", {
+        label: "Retry Now",
+        onClick: () => {
+          window.location.reload();
+        }
+      });
+    }
+  }, [status.connected, showToast]);
 
   useEffect(() => {
     async function load() {
       try {
         const [plRes, trRes] = await Promise.allSettled([
-          fetch("http://localhost:8000/pipelines?page=1&page_size=1").then((r) => r.json()),
-          fetch("http://localhost:8000/traces?page=1&page_size=1").then((r) => r.json()),
+          pipelinesApi.list(1, 1),
+          tracesApi.list(1, 100),
         ]);
-        setStats({
-          pipelines: plRes.status === "fulfilled" ? plRes.value.total ?? 0 : 0,
-          traces: trRes.status === "fulfilled" ? trRes.value.total ?? 0 : 0,
-          evals: 0,
-          totalCost: 0,
-        });
-      } catch {
-        // API not available — show zeros
+
+        let pipelineCount = 0;
+        let traceCount = 0;
+        let totalCost = 0;
+        let recent: Trace[] = [];
+
+        if (plRes.status === "fulfilled") {
+          pipelineCount = plRes.value.total ?? 0;
+        }
+
+        if (trRes.status === "fulfilled") {
+          const trData = trRes.value;
+          traceCount = trData.total ?? 0;
+          recent = trData.traces?.slice(0, 5) ?? [];
+          totalCost = trData.traces?.reduce((sum, t) => sum + (t.total_cost_usd ?? 0), 0) ?? 0;
+        }
+
+        if (status.connected) {
+          showToast("Dashboard data loaded successfully", "success");
+        }
+
+        setStats({ pipelines: pipelineCount, traces: traceCount, evals: 0, totalCost });
+        setRecentTraces(recent);
+
+        if (plRes.status === "rejected" || trRes.status === "rejected") {
+          setError("Some data failed to load — showing partial results.");
+        }
+      } catch (err) {
+        setError("Unable to reach the API. Showing cached defaults.");
       } finally {
         setLoading(false);
       }
     }
+
     load();
-  }, []);
+  }, [status.connected, showToast]);
 
   const quickActions = [
     { label: "Create Pipeline", href: "/pipelines", icon: "🔗" },
@@ -49,40 +92,79 @@ export default function DashboardPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h2 className="text-2xl font-bold text-zinc-900 dark:text-white">
-          Dashboard
-        </h2>
-        <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-1">
-          Overview of your EvalOps platform
-        </p>
-      </div>
+      {loading && (
+        <div className="mb-6">
+          <div className="h-8 w-48 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse mb-2" />
+          <div className="h-4 w-64 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+        </div>
+      )}
+
+      {(error || !status.connected) && (
+        <div className="rounded-lg border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 px-4 py-3 text-sm text-amber-800 dark:text-amber-300">
+          {error ?? "API is disconnected. Some features may not work."}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <MetricCard
-          label="Total Pipelines"
-          value={loading ? "—" : stats.pipelines}
-          icon="🔗"
-          subtitle="Active configurations"
-        />
-        <MetricCard
-          label="Traces"
-          value={loading ? "—" : stats.traces}
-          icon="🔍"
-          subtitle="Execution records"
-        />
-        <MetricCard
-          label="Evaluations"
-          value={loading ? "—" : stats.evals}
-          icon="✅"
-          subtitle="Scored trajectories"
-        />
-        <MetricCard
-          label="Total Cost"
-          value={loading ? "—" : `$${stats.totalCost.toFixed(2)}`}
-          icon="💰"
-          subtitle="Cumulative spend"
-        />
+        {loading ? (
+          <>
+            <CardSkeleton />
+            <CardSkeleton />
+            <CardSkeleton />
+            <CardSkeleton />
+          </>
+        ) : (
+          <>
+            <div className="bg-white dark:bg-zinc-900 rounded-lg border border-zinc-200 dark:border-zinc-800 p-5">
+              <div className="flex justify-between items-start">
+                <div className="space-y-2">
+                  <div className="h-4 w-24 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+                  <div className="h-8 w-16 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+                </div>
+                <div className="h-8 w-8 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+              </div>
+              <div className="mt-3">
+                <div className="h-2 w-full bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+              </div>
+            </div>
+            <div className="bg-white dark:bg-zinc-900 rounded-lg border border-zinc-200 dark:border-zinc-800 p-5">
+              <div className="flex justify-between items-start">
+                <div className="space-y-2">
+                  <div className="h-4 w-24 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+                  <div className="h-8 w-16 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+                </div>
+                <div className="h-8 w-8 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+              </div>
+              <div className="mt-3">
+                <div className="h-2 w-full bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+              </div>
+            </div>
+            <div className="bg-white dark:bg-zinc-900 rounded-lg border border-zinc-200 dark:border-zinc-800 p-5">
+              <div className="flex justify-between items-start">
+                <div className="space-y-2">
+                  <div className="h-4 w-24 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+                  <div className="h-8 w-16 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+                </div>
+                <div className="h-8 w-8 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+              </div>
+              <div className="mt-3">
+                <div className="h-2 w-full bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+              </div>
+            </div>
+            <div className="bg-white dark:bg-zinc-900 rounded-lg border border-zinc-200 dark:border-zinc-800 p-5">
+              <div className="flex justify-between items-start">
+                <div className="space-y-2">
+                  <div className="h-4 w-24 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+                  <div className="h-8 w-16 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+                </div>
+                <div className="h-8 w-8 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+              </div>
+              <div className="mt-3">
+                <div className="h-2 w-full bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+              </div>
+            </div>
+          </>
+        )}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -111,24 +193,58 @@ export default function DashboardPage() {
             Recent Activity
           </h3>
           <div className="space-y-3">
-            {[
-              { text: "Pipeline \"qa-pipeline\" run completed", time: "2m ago", status: "success" },
-              { text: "Eval scores: faithfulness 0.92, context_relevance 0.87", time: "5m ago", status: "info" },
-              { text: "Sweep sweep-a1b2c3 found 3 Pareto-optimal configs", time: "12m ago", status: "success" },
-              { text: "Plugin \"evalops-phi-filter\" installed", time: "1h ago", status: "info" },
-            ].map((item, i) => (
-              <div key={i} className="flex items-start gap-3 text-sm">
-                <span
-                  className={`mt-1 w-2 h-2 rounded-full flex-shrink-0 ${
-                    item.status === "success" ? "bg-emerald-500" : "bg-blue-500"
-                  }`}
-                />
-                <div className="flex-1 min-w-0">
-                  <p className="text-zinc-700 dark:text-zinc-300">{item.text}</p>
-                  <p className="text-xs text-zinc-400 mt-0.5">{item.time}</p>
+            {loading ? (
+              <div className="space-y-3">
+                <div className="flex items-start gap-3">
+                  <div className="w-2 h-2 rounded-full flex-shrink-0 bg-zinc-200 dark:bg-zinc-800 animate-pulse" />
+                  <div className="flex-1">
+                    <div className="h-4 w-32 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse mb-1" />
+                    <div className="h-3 w-24 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+                  </div>
+                </div>
+                <div className="flex items-start gap-3">
+                  <div className="w-2 h-2 rounded-full flex-shrink-0 bg-zinc-200 dark:bg-zinc-800 animate-pulse" />
+                  <div className="flex-1">
+                    <div className="h-4 w-32 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse mb-1" />
+                    <div className="h-3 w-24 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+                  </div>
+                </div>
+                <div className="flex items-start gap-3">
+                  <div className="w-2 h-2 rounded-full flex-shrink-0 bg-zinc-200 dark:bg-zinc-800 animate-pulse" />
+                  <div className="flex-1">
+                    <div className="h-4 w-32 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse mb-1" />
+                    <div className="h-3 w-24 bg-zinc-200 dark:bg-zinc-800 rounded animate-pulse" />
+                  </div>
                 </div>
               </div>
-            ))}
+            ) : recentTraces.length === 0 ? (
+              <p className="text-sm text-zinc-400">No recent traces.</p>
+            ) : (
+              recentTraces.map((trace) => (
+                <div
+                  key={trace.id}
+                  className="flex items-start gap-3 text-sm"
+                >
+                  <span
+                    className={`mt-1 w-2 h-2 rounded-full flex-shrink-0 ${
+                      trace.status === "completed"
+                        ? "bg-emerald-500"
+                        : trace.status === "failed"
+                          ? "bg-red-500"
+                          : "bg-blue-500"
+                    }`}
+                  />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-zinc-700 dark:text-zinc-300">
+                      Trace <span className="font-mono text-xs">{trace.pipeline_id}</span> — {trace.status}
+                    </p>
+                    <p className="text-xs text-zinc-400 mt-0.5">
+                      {new Date(trace.started_at).toLocaleString()}
+                    </p>
+                  </div>
+                </div>
+              ))
+            )}
           </div>
         </div>
       </div>

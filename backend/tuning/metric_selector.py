@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import structlog
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-from backend.eval.metrics import METRIC_REGISTRY, BaseMetric, get_metric
+from backend.eval.metrics import METRIC_REGISTRY
 from backend.tuning.user_preferences import MetricPreference
 
 logger = structlog.get_logger(__name__)

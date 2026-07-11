@@ -117,7 +117,7 @@ class PluginDiscovery:
 
     def _discover_pypi_packages(self, prefix: str) -> list[str]:
         """Use the PyPI simple index to discover packages matching a prefix."""
-        search_url = f"https://pypi.org/simple/"
+        search_url = "https://pypi.org/simple/"
         try:
             request = Request(search_url, headers={"Accept": "application/json"})
             with urlopen(request, timeout=10) as response:
@@ -166,6 +166,7 @@ class PluginDiscovery:
     def check_compatibility(requires_python: str) -> dict[str, Any]:
         """Check if a requires-python specifier is compatible with the running interpreter."""
         import sys
+
         from packaging.specifiers import SpecifierSet
 
         result = {"compatible": True, "python_version": f"{sys.version_info.major}.{sys.version_info.minor}"}

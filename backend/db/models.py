@@ -221,6 +221,10 @@ class Sweep(Base):
     n_trials: Mapped[int] = mapped_column(Integer, default=50)
     trials_completed: Mapped[int] = mapped_column(Integer, default=0)
     best_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    timeout_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    estimated_completion: Mapped[datetime | None] = mapped_column(
+        nullable=True, default=None
+    )
     best_params: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     sweep_metadata: Mapped[dict[str, Any]] = mapped_column(
         "metadata", JSON, default=dict

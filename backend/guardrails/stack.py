@@ -13,7 +13,7 @@ from typing import Any
 import structlog
 
 from .compounding_analyzer import CompoundingAnalyzer, FPOverlapReport
-from .filters.base import BaseFilter, FilterDecision, FilterMetrics, FilterResult, RiskLevel
+from .filters.base import BaseFilter, FilterDecision, FilterResult, RiskLevel
 
 logger = structlog.get_logger(__name__)
 

@@ -7,21 +7,19 @@ generates frontier curve data, and supports visualization export.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 import optuna
 import structlog
 from pydantic import BaseModel, Field
 
+from backend.core.config import PipelineConfig
 from backend.optimizer.config_sweeper import (
     EvalFunction,
     EvalOutcome,
     define_search_space,
 )
-
-if TYPE_CHECKING:
-    from backend.core.config import PipelineConfig
 
 logger = structlog.get_logger(__name__)
 

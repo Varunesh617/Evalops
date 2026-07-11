@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -46,7 +47,7 @@ class PluginRating:
     plugin_id: str
     average: float = 0.0
     count: int = 0
-    distribution: dict[int, int] = field(default_factory=lambda: {i: 0 for i in range(1, 6)})
+    distribution: dict[int, int] = field(default_factory=lambda: dict.fromkeys(range(1, 6), 0))
 
 
 class PluginRegistry:
@@ -55,7 +56,7 @@ class PluginRegistry:
     def __init__(self) -> None:
         self._plugins: dict[str, PluginRecord] = {}
         self._ratings: dict[str, PluginRating] = {}
-        self._usage_log: list[dict[str, Any]] = []
+        self._usage_log: deque[dict[str, Any]] = deque(maxlen=1000)
 
     # ------------------------------------------------------------------
     # Register / unregister

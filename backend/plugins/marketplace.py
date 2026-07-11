@@ -8,10 +8,9 @@ from typing import Any
 
 import structlog
 
-from backend.plugins.discovery import DiscoveryCache, DiscoveredPlugin, PluginDiscovery
+from backend.plugins.discovery import PluginDiscovery
 from backend.plugins.loader import PluginLoader
-from backend.plugins.registry import PluginRating, PluginRecord, PluginRegistry
-from backend.plugins.sdk import PluginBase
+from backend.plugins.registry import PluginRating, PluginRegistry
 
 logger = structlog.get_logger(__name__)
 

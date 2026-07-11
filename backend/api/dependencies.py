@@ -26,8 +26,14 @@ _in_memory: dict[str, Any] = {}
 if not _database_url:
     from backend.db.in_memory_repositories import (
         EvalRepository as _InMemEvalRepo,
+    )
+    from backend.db.in_memory_repositories import (
         PipelineRepository as _InMemPipelineRepo,
+    )
+    from backend.db.in_memory_repositories import (
         SweepRepository as _InMemSweepRepo,
+    )
+    from backend.db.in_memory_repositories import (
         TraceRepository as _InMemTraceRepo,
     )
 

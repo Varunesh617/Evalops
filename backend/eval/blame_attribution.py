@@ -151,12 +151,12 @@ class _Rule:
 
 
 _HEURISTIC_RULES: list[_Rule] = [
-    _Rule(_rule_exception, FailureMode.EXCEPTION, Severity.HIGH, "{error}"),
     _Rule(_rule_timeout, FailureMode.TIMEOUT, Severity.CRITICAL, "Step timed out"),
     _Rule(_rule_guardrail_violation, FailureMode.GUARDRAIL_VIOLATION, Severity.HIGH, "Guardrail blocked output"),
     _Rule(_rule_low_score, FailureMode.LOW_SCORE, Severity.MEDIUM, "Step quality score {score:.2f} below threshold"),
     _Rule(_rule_empty_result, FailureMode.EMPTY_RESULT, Severity.MEDIUM, "Step produced empty output"),
     _Rule(_rule_token_limit, FailureMode.TOKEN_LIMIT, Severity.HIGH, "Token limit exceeded: {error}"),
+    _Rule(_rule_exception, FailureMode.EXCEPTION, Severity.HIGH, "{error}"),
 ]
 
 # Cascade propagation: probability multiplier applied at each downstream step.

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator
 
 import structlog
 from fastapi import FastAPI, Request, Response
@@ -107,7 +107,7 @@ class TimingMiddleware(BaseHTTPMiddleware):
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     logger.info("evalops_api_startup", version=app.version)
     yield
     logger.info("evalops_api_shutdown")

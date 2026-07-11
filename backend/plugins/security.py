@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import fnmatch
 import importlib.metadata
-import signal
-import sys
 import threading
 import time
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Any, Generator
+from pathlib import Path
+from typing import Any
 
 import structlog
 
@@ -134,11 +135,13 @@ class PluginSandbox:
         safe_imports: frozenset[str] | None = None,
         blocked_builtins: frozenset[str] | None = None,
         max_execution_seconds: float = 30.0,
+        allowlist: set[str] | None = None,
     ) -> None:
         self._blocked = blocked_imports or BLOCKED_IMPORTS
         self._safe = safe_imports or SAFE_IMPORTS
         self._blocked_builtins = blocked_builtins or BLOCKED_BUILTINS
         self._max_exec = max_execution_seconds
+        self._allowlist = allowlist
         self._audit_log: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
@@ -174,6 +177,36 @@ class PluginSandbox:
                 f"Plugin uses blocked imports: {', '.join(violations)}. "
                 f"Allowed: {', '.join(sorted(self._safe))}"
             )
+
+    # ------------------------------------------------------------------
+    # Path validation
+    # ------------------------------------------------------------------
+
+    def validate_path(self, path: Path) -> bool:
+        """Check if a plugin file path is permitted by the allowlist.
+
+        Returns ``True`` if no allowlist is configured (open mode) or when
+        the resolved path matches at least one allowlist pattern.  Patterns
+        support both ``fnmatch`` full-path matching and ``Path.match``
+        relative-name matching.
+
+        Raises :class:`PluginSecurityError` when the path is rejected.
+        """
+        if not self._allowlist:
+            self._log_audit("path_check_skipped", path=str(path), reason="no_allowlist")
+            return True
+
+        resolved = str(path.resolve())
+        for pattern in self._allowlist:
+            if fnmatch.fnmatch(resolved, pattern) or path.match(pattern):
+                self._log_audit("path_allowed", path=resolved, pattern=pattern)
+                return True
+
+        self._log_audit("path_rejected", path=resolved, allowlist=sorted(self._allowlist))
+        raise PluginSecurityError(
+            f"Plugin path '{resolved}' is not in the allowlist. "
+            f"Allowed patterns: {', '.join(sorted(self._allowlist))}"
+        )
 
     # ------------------------------------------------------------------
     # Builtin restriction
@@ -232,7 +265,7 @@ class PluginSandbox:
     # ------------------------------------------------------------------
 
     @contextmanager
-    def timed_execution(self, plugin_id: str) -> Generator[None, None, None]:
+    def timed_execution(self, plugin_id: str) -> Generator[None]:
         """Context manager that raises if execution exceeds max seconds.
 
         Uses a daemon thread to enforce the timeout — safe for CPython
