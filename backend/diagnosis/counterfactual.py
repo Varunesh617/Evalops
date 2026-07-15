@@ -8,8 +8,10 @@ improvement.
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import uuid
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -23,6 +25,80 @@ from backend.eval.models import StepType
 from backend.eval.models import Trajectory as EvalTrajectory
 
 logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Real re-run support (3.1)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class VariantResult:
+    """Outcome of re-running a pipeline with a single intervention applied.
+
+    Produced by a :class:`PipelineExecutor`. The original trace is never
+    mutated — the executor is expected to work on a copy of the pipeline
+    configuration for the variant.
+    """
+
+    overall_score: float
+    step_scores: dict[str, float] = field(default_factory=dict)
+    cost_usd: float = 0.0
+    latency_ms: float = 0.0
+    error: str | None = None
+
+
+class PipelineExecutor(ABC):
+    """Abstraction over actually re-running a pipeline with an intervention.
+
+    Implementations should re-execute a *variant* of the pipeline (a copy with
+    the intervention applied) and return a :class:`VariantResult`. They must
+    never mutate the original trace or pipeline config.
+    """
+
+    @abstractmethod
+    async def run_variant(
+        self,
+        trace: Trajectory,
+        intervention: Intervention,
+        *,
+        timeout_seconds: float = 60.0,
+    ) -> VariantResult:
+        """Re-run the pipeline variant and return measured outcomes."""
+        raise NotImplementedError
+
+
+@dataclass(slots=True)
+class RealRunResult:
+    """Result of actually re-running the pipeline for one intervention."""
+
+    intervention: Intervention
+    counterfactual_score: float  # real measured score for the variant
+    improvement_delta: float  # counterfactual_score - original_score
+    confidence: float  # 0.0–1.0
+    cost_usd: float = 0.0
+    latency_ms: float = 0.0
+    error: str | None = None
+    original_step_scores: dict[str, float] = field(default_factory=dict)
+    counterfactual_step_scores: dict[str, float] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "intervention": {
+                "change_type": str(self.intervention.change_type),
+                "original_value": self.intervention.original_value,
+                "counterfactual_value": self.intervention.counterfactual_value,
+                "description": self.intervention.description,
+            },
+            "counterfactual_score": round(self.counterfactual_score, 4),
+            "improvement_delta": round(self.improvement_delta, 4),
+            "confidence": round(self.confidence, 4),
+            "cost_usd": round(self.cost_usd, 4),
+            "latency_ms": round(self.latency_ms, 2),
+            "error": self.error,
+            "original_step_scores": self.original_step_scores,
+            "counterfactual_step_scores": self.counterfactual_step_scores,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -373,9 +449,15 @@ class CounterfactualEngine:
         self,
         blame_engine: BlameAttributionEngine | None = None,
         eval_engine: EvalEngine | None = None,
+        executor: PipelineExecutor | None = None,
     ) -> None:
         self._blame_engine = blame_engine or BlameAttributionEngine()
         self._eval_engine = eval_engine
+        self._executor = executor
+
+    def set_executor(self, executor: PipelineExecutor | None) -> None:
+        """Wire (or clear) a real pipeline executor for actual re-runs."""
+        self._executor = executor
 
     # -- public API ----------------------------------------------------------
 
@@ -444,6 +526,116 @@ class CounterfactualEngine:
             best_delta=report.best_delta,
         )
         return report
+
+    # -- real re-run (3.1) ---------------------------------------------------
+
+    async def run_real(
+        self,
+        trajectory: Trajectory,
+        intervention: Intervention,
+        *,
+        blame: BlameReport | None = None,
+        timeout_seconds: float = 60.0,
+    ) -> RealRunResult:
+        """Actually re-run the pipeline with *intervention* applied.
+
+        Uses the wired :class:`PipelineExecutor` to measure a real delta.
+        The original *trajectory* is never mutated. If no executor is wired,
+        this falls back to the simulation path so the call always succeeds.
+        """
+        if blame is None:
+            blame = self._blame_engine.analyse(trajectory)
+
+        original_score = _compute_overall_score(trajectory)
+        original_step_scores = _extract_step_scores(trajectory)
+
+        if self._executor is None:
+            sim_score = self._simulate_intervention(
+                intervention, original_score, trajectory, blame
+            )
+            confidence = _estimate_confidence(
+                intervention, original_score, sim_score, blame
+            )
+            logger.info(
+                "counterfactual_real_fallback_simulation",
+                change_type=str(intervention.change_type),
+            )
+            return RealRunResult(
+                intervention=intervention,
+                counterfactual_score=round(sim_score, 4),
+                improvement_delta=round(sim_score - original_score, 4),
+                confidence=confidence,
+                original_step_scores=dict(original_step_scores),
+                counterfactual_step_scores=self._simulated_step_scores(
+                    intervention, original_step_scores, blame
+                ),
+            )
+
+        try:
+            result = await asyncio.wait_for(
+                self._executor.run_variant(
+                    trajectory, intervention, timeout_seconds=timeout_seconds
+                ),
+                timeout=timeout_seconds,
+            )
+        except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+            logger.warning(
+                "counterfactual_real_run_failed",
+                change_type=str(intervention.change_type),
+                error=str(exc),
+            )
+            return RealRunResult(
+                intervention=intervention,
+                counterfactual_score=round(original_score, 4),
+                improvement_delta=0.0,
+                confidence=0.0,
+                error=str(exc),
+                original_step_scores=dict(original_step_scores),
+                counterfactual_step_scores=dict(original_step_scores),
+            )
+
+        delta = result.overall_score - original_score
+        confidence = _estimate_confidence(
+            intervention, original_score, result.overall_score, blame
+        )
+        logger.info(
+            "counterfactual_real_run_complete",
+            change_type=str(intervention.change_type),
+            measured_score=result.overall_score,
+            measured_delta=delta,
+        )
+        return RealRunResult(
+            intervention=intervention,
+            counterfactual_score=round(result.overall_score, 4),
+            improvement_delta=round(delta, 4),
+            confidence=confidence,
+            cost_usd=result.cost_usd,
+            latency_ms=result.latency_ms,
+            original_step_scores=dict(original_step_scores),
+            counterfactual_step_scores=result.step_scores,
+        )
+
+    async def run_real_batch(
+        self,
+        trajectory: Trajectory,
+        interventions: list[Intervention],
+        *,
+        blame: BlameReport | None = None,
+        timeout_seconds: float = 60.0,
+        max_concurrency: int = 4,
+    ) -> list[RealRunResult]:
+        """Run several real interventions concurrently (bounded semaphore)."""
+        if blame is None:
+            blame = self._blame_engine.analyse(trajectory)
+        sem = asyncio.Semaphore(max_concurrency)
+
+        async def _bound(iv: Intervention) -> RealRunResult:
+            async with sem:
+                return await self.run_real(
+                    trajectory, iv, blame=blame, timeout_seconds=timeout_seconds
+                )
+
+        return await asyncio.gather(*(_bound(iv) for iv in interventions))
 
     # -- internals -----------------------------------------------------------
 

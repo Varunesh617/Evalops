@@ -364,7 +364,11 @@ async def get_smart_defaults(
     avg_quality: float = 0.75,
     total_runs: int = 0,
 ) -> dict[str, Any]:
-    """Get AI-powered configuration recommendations."""
+    """Get AI-powered configuration recommendations.
+
+    When stored user preferences exist (DB-backed, Phase 1) they personalise
+    the suggestions (3.3); otherwise domain defaults are used.
+    """
     try:
         domain_enum = DomainType(domain)
     except ValueError:
@@ -379,7 +383,9 @@ async def get_smart_defaults(
         total_runs=total_runs,
         domain=domain_enum,
     )
-    engine = SmartDefaults(stats)
+    # Personalise from stored user preferences when available.
+    user_prefs = await _load_prefs(user_id)
+    engine = SmartDefaults(stats, user_preferences=user_prefs)
     result = engine.generate()
     return result.model_dump()
 

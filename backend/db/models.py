@@ -414,3 +414,46 @@ class UserPreferenceState(Base):
     )
 
     __table_args__ = (Index("ix_user_preference_states_user_id", "user_id"),)
+
+
+# ---------------------------------------------------------------------------
+# AppliedRecommendation
+# ---------------------------------------------------------------------------
+
+
+class AppliedRecommendation(Base):
+    """Tracks recommendations applied by users and their downstream outcomes.
+
+    Powers the recommendation feedback loop (Phase 3.2): each applied
+    recommendation is recorded once, then later updated with the measured
+    outcome (e.g. counterfactual delta, score change) once available.
+    """
+
+    __tablename__ = "applied_recommendations"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_new_id)
+    user_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    trace_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    recommendation_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    category: Mapped[str] = mapped_column(String(32), default="general")
+    action: Mapped[str] = mapped_column(Text, default="")
+    change_type: Mapped[str] = mapped_column(String(64), default="")
+    applied_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), default=_utcnow
+    )
+    outcome_status: Mapped[str] = mapped_column(String(32), default="pending")
+    measured_delta: Mapped[float | None] = mapped_column(Float, nullable=True)
+    measured_cost_delta: Mapped[float | None] = mapped_column(Float, nullable=True)
+    measured_latency_delta_ms: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    outcome_notes: Mapped[str] = mapped_column(Text, default="")
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON, default=dict
+    )
+
+    __table_args__ = (
+        Index("ix_applied_recommendations_user_id", "user_id"),
+        Index("ix_applied_recommendations_trace_id", "trace_id"),
+        Index("ix_applied_recommendations_recommendation_id", "recommendation_id"),
+    )

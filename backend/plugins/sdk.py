@@ -8,6 +8,7 @@ from typing import Any
 
 from backend.eval.models import MetricResult, Step, Trajectory
 from backend.guardrails.filters.base import BaseFilter, FilterResult
+from backend.plugins.async_utils import maybe_await, run_sync
 
 # ---------------------------------------------------------------------------
 # Core plugin base
@@ -76,6 +77,22 @@ class PluginBase(abc.ABC):
     def on_disable(self) -> None:
         """Called when the plugin is deactivated."""
 
+    async def on_install_async(self) -> None:
+        """Async twin of :meth:`on_install` — runs the sync hook on a thread."""
+        await run_sync(self.on_install)
+
+    async def on_uninstall_async(self) -> None:
+        """Async twin of :meth:`on_uninstall`."""
+        await run_sync(self.on_uninstall)
+
+    async def on_enable_async(self) -> None:
+        """Async twin of :meth:`on_enable`."""
+        await run_sync(self.on_enable)
+
+    async def on_disable_async(self) -> None:
+        """Async twin of :meth:`on_disable`."""
+        await run_sync(self.on_disable)
+
 
 # ---------------------------------------------------------------------------
 # Metric plugin
@@ -121,6 +138,25 @@ class MetricPlugin(PluginBase):
             metadata={"plugin_version": self.version},
         )
 
+    async def evaluate_async(self, trajectory: Trajectory) -> MetricResult:
+        """Async twin of :meth:`evaluate` — scores steps on a worker thread."""
+        from backend.eval.metrics.base import BaseMetric
+
+        step_scores = []
+        scores: list[float] = []
+        for step in trajectory.steps:
+            score = BaseMetric.clamp(await run_sync(self.score_step, trajectory, step))
+            scores.append(score)
+            step_scores.append(_make_step_score(step.step_id, self.plugin_id, score))
+        overall = BaseMetric.clamp(self.aggregate_steps(scores))
+        return MetricResult(
+            metric_name=self.plugin_id,
+            overall_score=overall,
+            step_scores=step_scores,
+            details=f"{self.name}: {overall:.4f}",
+            metadata={"plugin_version": self.version},
+        )
+
 
 # ---------------------------------------------------------------------------
 # Filter plugin
@@ -138,6 +174,12 @@ class FilterPlugin(PluginBase):
     ) -> FilterResult:
         """Run the filter and return a FilterResult."""
         ...
+
+    async def check_async(
+        self, input_text: str, *, context: str = "", output: str = ""
+    ) -> FilterResult:
+        """Async twin of :meth:`check` — runs the sync check on a thread."""
+        return await run_sync(self.check, input_text, context=context, output=output)
 
     def create_filter_instance(self, **kwargs: Any) -> BaseFilter:
         """Return a ``BaseFilter`` subclass wired to this plugin's logic.
@@ -219,6 +261,22 @@ class IntegrationPlugin(PluginBase):
     def health_check(self) -> dict[str, Any]:
         """Return connectivity status.  Override for real checks."""
         return {"status": "unknown"}
+
+    async def connect_async(self, **kwargs: Any) -> None:
+        """Async twin of :meth:`connect`."""
+        await run_sync(self.connect, **kwargs)
+
+    async def disconnect_async(self) -> None:
+        """Async twin of :meth:`disconnect`."""
+        await run_sync(self.disconnect)
+
+    async def fetch_trajectories_async(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Async twin of :meth:`fetch_trajectories`."""
+        return await run_sync(self.fetch_trajectories, limit=limit)
+
+    async def health_check_async(self) -> dict[str, Any]:
+        """Async twin of :meth:`health_check`."""
+        return await run_sync(self.health_check)
 
 
 # ---------------------------------------------------------------------------

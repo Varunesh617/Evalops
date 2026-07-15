@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from enum import StrEnum
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import BaseModel, Field, SecretStr
@@ -141,3 +143,31 @@ class PipelineConfig(BaseModel):
     total_timeout_seconds: Annotated[float, Field(ge=1.0)] = 180.0
     enable_tracing: bool = True
     trace_sample_rate: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0
+
+
+# ---------------------------------------------------------------------------
+# Plugin security config (signing)
+# ---------------------------------------------------------------------------
+
+DEFAULT_PLUGIN_PUBKEY_PATH = (
+    Path(__file__).resolve().parent.parent / "plugins" / "keys" / "evalops_pub.pem"
+)
+
+
+class PluginSecurityConfig(BaseModel):
+    """Environment-driven config for plugin cryptographic signing.
+
+    Set ``EVALOPS_REQUIRE_SIGNED=true`` in production to block unsigned or
+    unverifiable plugins.  When unset (dev mode), unsigned plugins only emit an
+    advisory warning.
+    """
+
+    require_signed: bool = Field(
+        default_factory=lambda: os.getenv("EVALOPS_REQUIRE_SIGNED", "false").lower()
+        in {"1", "true", "yes"}
+    )
+    public_key_path: Path = Field(
+        default_factory=lambda: Path(
+            os.getenv("EVALOPS_PLUGIN_PUBKEY", str(DEFAULT_PLUGIN_PUBKEY_PATH))
+        )
+    )

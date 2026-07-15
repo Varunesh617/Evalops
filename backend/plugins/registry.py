@@ -77,6 +77,7 @@ class PluginRegistry:
     async def register(self, plugin: PluginBase, *, source: str = "unknown") -> PluginRecord:
         """Register a PluginBase instance and return its record."""
         plugin_type = type(plugin).__name__
+        dependencies = list(getattr(plugin, "dependencies", []) or [])
         record = PluginRecord(
             plugin_id=plugin.plugin_id,
             name=plugin.name,
@@ -86,6 +87,7 @@ class PluginRegistry:
             plugin_type=plugin_type,
             entry_point=source,
             config_schema=plugin.config_schema(),
+            dependencies=dependencies,
         )
         existing = self._plugins.get(plugin.plugin_id)
         if existing is not None:
@@ -231,6 +233,48 @@ class PluginRegistry:
                     "versions": versions,
                     "plugin_ids": [r.plugin_id for r in records],
                 })
+        return conflicts
+
+    def resolve_dependencies(self, plugin_id: str) -> list[dict[str, Any]]:
+        """Check *plugin_id*'s declared dependencies against installed records.
+
+        Returns a structured list of conflicts; an empty list means the
+        dependency set is compatible.  Reuses :meth:`check_version_conflicts`
+        over a merged view of the plugin's deps plus currently-installed records.
+        """
+        record = self._plugins.get(plugin_id)
+        if record is None:
+            return [{"plugin_id": plugin_id, "error": "not_registered"}]
+
+        conflicts: list[dict[str, Any]] = []
+        for dep in record.dependencies:
+            dep_name = dep.split("==")[0].strip()
+            if not dep_name:
+                continue
+            matching = [
+                r for r in self._plugins.values()
+                if r.name == dep_name or r.plugin_id == dep_name
+            ]
+            if not matching:
+                conflicts.append({
+                    "dependency": dep,
+                    "status": "unmet",
+                    "plugin_ids": [],
+                })
+                continue
+            # If a specific version was pinned, ensure it is satisfied.
+            if "==" in dep:
+                pinned = dep.split("==", 1)[1].strip()
+                versions = sorted({r.version for r in matching})
+                if pinned not in versions:
+                    conflicts.append({
+                        "dependency": dep,
+                        "status": "version_mismatch",
+                        "installed": versions,
+                        "plugin_ids": [r.plugin_id for r in matching],
+                    })
+        # Also surface any internal name collisions among installed records.
+        conflicts.extend(self.check_version_conflicts())
         return conflicts
 
     def check_updates(self) -> list[dict[str, Any]]:

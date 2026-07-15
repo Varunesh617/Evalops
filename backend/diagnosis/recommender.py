@@ -12,6 +12,7 @@ from typing import Any
 
 import structlog
 
+from backend.diagnosis.counterfactual import ChangeType
 from backend.eval.blame_attribution import BlameReport, FailureMode, Severity
 
 logger = structlog.get_logger(__name__)
@@ -43,6 +44,36 @@ class Difficulty(enum.StrEnum):
     HARD = "hard"
 
 
+# Rough per-step cost/latency deltas (USD, ms) introduced by an intervention.
+# Used to surface a cost/latency tradeoff next to each recommendation (3.5).
+# Negative values mean a saving; positive mean an added cost/latency.
+_ESTIMATED_COST_DELTA: dict[ChangeType, float] = {
+    ChangeType.RETRIEVAL_TOP_K: 0.0005,  # more candidates => more token cost
+    ChangeType.RETRIEVAL_MODEL: 0.0040,  # stronger embedding model is pricier
+    ChangeType.RERANKER_MODEL: 0.0020,
+    ChangeType.REASONING_MODEL: 0.0120,  # bigger reasoning model is the cost driver
+    ChangeType.GUARDRAIL_THRESHOLD: 0.0,
+    ChangeType.GUARDRAIL_DISABLED: -0.0010,  # fewer blocked reruns
+    ChangeType.FEW_SHOT_EXAMPLES: 0.0015,  # more prompt tokens
+    ChangeType.TEMPERATURE: 0.0,
+    ChangeType.CONTEXT_WINDOW: 0.0030,  # more context tokens
+    ChangeType.SYSTEM_PROMPT: 0.0008,
+}
+
+_ESTIMATED_LATENCY_DELTA_MS: dict[ChangeType, float] = {
+    ChangeType.RETRIEVAL_TOP_K: 120.0,
+    ChangeType.RETRIEVAL_MODEL: 200.0,
+    ChangeType.RERANKER_MODEL: 150.0,
+    ChangeType.REASONING_MODEL: 600.0,
+    ChangeType.GUARDRAIL_THRESHOLD: 0.0,
+    ChangeType.GUARDRAIL_DISABLED: -80.0,
+    ChangeType.FEW_SHOT_EXAMPLES: 100.0,
+    ChangeType.TEMPERATURE: 0.0,
+    ChangeType.CONTEXT_WINDOW: 250.0,
+    ChangeType.SYSTEM_PROMPT: 40.0,
+}
+
+
 @dataclass(frozen=True, slots=True)
 class Recommendation:
     """A single actionable recommendation."""
@@ -54,6 +85,9 @@ class Recommendation:
     snippet: str = ""
     rationale: str = ""
     priority: int = 0  # higher = more important
+    change_type: str | None = None  # maps to a counterfactual ChangeType when known
+    estimated_cost_delta_usd: float | None = None
+    estimated_latency_delta_ms: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -64,6 +98,9 @@ class Recommendation:
             "snippet": self.snippet,
             "rationale": self.rationale,
             "priority": self.priority,
+            "change_type": self.change_type,
+            "estimated_cost_delta_usd": self.estimated_cost_delta_usd,
+            "estimated_latency_delta_ms": self.estimated_latency_delta_ms,
         }
 
 
@@ -102,6 +139,7 @@ class _Rule:
     snippet: str
     rationale: str
     priority: int
+    change_type: ChangeType | None = None  # linked counterfactual change type
 
 
 def _priority_for_severity(severity: Severity) -> int:
@@ -128,6 +166,7 @@ _RULES: list[_Rule] = [
         ),
         rationale="A larger candidate pool increases the chance that relevant documents survive reranking.",
         priority=70,
+        change_type=ChangeType.RETRIEVAL_TOP_K,
     ),
     _Rule(
         FailureMode.LOW_SCORE,
@@ -144,6 +183,7 @@ _RULES: list[_Rule] = [
         ),
         rationale="Higher-quality embeddings produce better similarity scores and more relevant retrievals.",
         priority=75,
+        change_type=ChangeType.RETRIEVAL_MODEL,
     ),
     _Rule(
         FailureMode.LOW_SCORE,
@@ -195,6 +235,7 @@ _RULES: list[_Rule] = [
         ),
         rationale="Smaller candidate sets execute faster and avoid timeout cascades.",
         priority=65,
+        change_type=ChangeType.RETRIEVAL_TOP_K,
     ),
     # --- Reasoning failures ---
     _Rule(
@@ -212,6 +253,7 @@ _RULES: list[_Rule] = [
         ),
         rationale="Stronger models produce more coherent, grounded reasoning from the same context.",
         priority=80,
+        change_type=ChangeType.REASONING_MODEL,
     ),
     _Rule(
         FailureMode.LOW_SCORE,
@@ -234,6 +276,7 @@ _RULES: list[_Rule] = [
         ),
         rationale="Few-shot examples guide the model toward the desired output format and reasoning style.",
         priority=70,
+        change_type=ChangeType.FEW_SHOT_EXAMPLES,
     ),
     _Rule(
         FailureMode.LOW_SCORE,
@@ -285,6 +328,7 @@ _RULES: list[_Rule] = [
         ),
         rationale="Smaller models are significantly faster and often sufficient for straightforward queries.",
         priority=60,
+        change_type=ChangeType.REASONING_MODEL,
     ),
     # --- Guardrail failures ---
     _Rule(
@@ -304,6 +348,7 @@ _RULES: list[_Rule] = [
         ),
         rationale="Aggressive guardrails block legitimate outputs; tuning thresholds balances safety and usability.",
         priority=85,
+        change_type=ChangeType.GUARDRAIL_THRESHOLD,
     ),
     _Rule(
         FailureMode.GUARDRAIL_VIOLATION,
@@ -436,6 +481,19 @@ class RecommendationEngine:
                 if rule.category == RecommendationCategory.RETRIEVAL and "retrieve" in blame.root_cause_step or rule.category == RecommendationCategory.REASONING and "reason" in blame.root_cause_step:
                     priority += 10
 
+            # Cost / latency tradeoff (3.5): estimate the delta introduced by
+            # the linked intervention so the UI can show a cost comparison.
+            cost_delta = (
+                _ESTIMATED_COST_DELTA.get(rule.change_type)  # type: ignore[arg-type]
+                if rule.change_type is not None
+                else None
+            )
+            latency_delta = (
+                _ESTIMATED_LATENCY_DELTA_MS.get(rule.change_type)  # type: ignore[arg-type]
+                if rule.change_type is not None
+                else None
+            )
+
             matched.append(
                 Recommendation(
                     category=rule.category,
@@ -445,6 +503,9 @@ class RecommendationEngine:
                     snippet=rule.snippet,
                     rationale=rule.rationale,
                     priority=priority,
+                    change_type=str(rule.change_type) if rule.change_type else None,
+                    estimated_cost_delta_usd=cost_delta,
+                    estimated_latency_delta_ms=latency_delta,
                 )
             )
 

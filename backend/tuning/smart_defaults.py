@@ -11,6 +11,7 @@ from backend.tuning.user_preferences import (
     MetricPreference,
     OptimizationConstraints,
     OptimizationGoal,
+    UserPreferences,
     get_domain_defaults,
 )
 
@@ -93,13 +94,31 @@ class PipelineUsageStats:
 class SmartDefaults:
     """Analyze pipeline usage and recommend optimal tuning configurations."""
 
-    def __init__(self, usage_stats: PipelineUsageStats | None = None) -> None:
+    def __init__(
+        self,
+        usage_stats: PipelineUsageStats | None = None,
+        user_preferences: UserPreferences | None = None,
+    ) -> None:
         self._stats = usage_stats or PipelineUsageStats()
+        # Per-user stored preferences (3.3). When present they override the
+        # domain defaults and bias the suggestions toward what the user already
+        # selected.
+        self._user_prefs = user_preferences
 
     def generate(self) -> SmartDefaultsResult:
-        """Generate a full set of smart default recommendations."""
-        domain = self._stats.domain
-        base_prefs = get_domain_defaults(domain)
+        """Generate a full set of smart default recommendations.
+
+        When :attr:`_user_prefs` is set, suggestions are personalised to the
+        stored user preferences rather than starting from domain defaults.
+        """
+        if self._user_prefs is not None:
+            domain = self._user_prefs.domain
+            base_prefs = self._user_prefs
+            personalized = True
+        else:
+            domain = self._stats.domain
+            base_prefs = get_domain_defaults(domain)
+            personalized = False
 
         metric_suggestions = self._suggest_metrics(base_prefs.metrics)
         filter_suggestions = self._suggest_filters(base_prefs.filters)
@@ -107,6 +126,8 @@ class SmartDefaults:
         confidence = self._compute_confidence()
 
         reasoning_parts: list[str] = []
+        if self._user_prefs is not None:
+            reasoning_parts.append("Personalised to stored user preferences.")
         if self._stats.total_runs > 100:
             reasoning_parts.append("High confidence from large run history.")
         elif self._stats.total_runs > 10:

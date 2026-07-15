@@ -12,9 +12,16 @@ from backend.db.in_memory_repositories import (  # noqa: F401
     TraceRepository,
 )
 
+# SQLAlchemy-backed repositories (require a session); re-exported so that
+# ``from backend.db.repositories import AppliedRecommendationRepository`` works.
+from backend.db.repository import (  # noqa: F401
+    AppliedRecommendationRepository,
+)
+
 __all__ = [
     "EvalRepository",
     "PipelineRepository",
     "SweepRepository",
     "TraceRepository",
+    "AppliedRecommendationRepository",
 ]

@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
+import importlib
+import re
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
+# Strict allowlist for package names passed to pip as argv.  Only simple PEP 508
+# names with an ASCII letter/digit start and no shell/flag metacharacters.
+_PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+from backend.plugins.async_utils import maybe_await
 from backend.plugins.discovery import PluginDiscovery
 from backend.plugins.loader import PluginLoader
 from backend.plugins.registry import PluginRating, PluginRegistry
@@ -61,6 +70,7 @@ class PluginMarketplace:
         self._discovery = discovery or PluginDiscovery()
         self._install_log: list[dict[str, Any]] = []
         self._installed: dict[str, Any] = {}
+        self._instances: dict[str, Any] = {}
         self._db_repo: PluginStateRepository | None = None
 
     def set_db_repo(self, repo: PluginStateRepository | None) -> None:
@@ -133,6 +143,16 @@ class PluginMarketplace:
                 version=existing.version,
             )
 
+        # Real pip install (4.2): only when the package is not already importable.
+        if not self._is_importable(plugin_id):
+            ok, err = await self._pip_install(plugin_id, version)
+            if not ok:
+                return InstallResult(
+                    success=False,
+                    plugin_id=plugin_id,
+                    message=f"pip install failed: {err}",
+                )
+
         try:
             plugins = self._loader.load_from_pip(plugin_id)
         except Exception as exc:
@@ -149,13 +169,42 @@ class PluginMarketplace:
                 message=f"Package '{plugin_id}' does not contain EvalOps plugins",
             )
 
+        # CRITICAL 3: verify the plugin signature AFTER loading the module but
+        # BEFORE registering it.  When EVALOPS_REQUIRE_SIGNED is enabled, an
+        # unsigned/unverifiable plugin aborts the install (no registration).
+        if self._loader._sandbox is not None:
+            try:
+                self._loader._enforce_signing(plugin_id)
+            except Exception as exc:  # noqa: BLE001 - surface as install failure
+                return InstallResult(
+                    success=False,
+                    plugin_id=plugin_id,
+                    message=f"Plugin signature verification failed: {exc}",
+                )
+
         installed_version = ""
         for plugin in plugins.values():
             record = await self._registry.register(plugin, source=f"pip:{plugin_id}")
-            plugin.on_install()
+            # Install declared dependencies (4.3) before firing lifecycle hooks.
+            # Dependency names are validated and pinned to the declared version
+            # so unpinned/arbitrary specs cannot be smuggled in.
+            for dep in getattr(plugin, "dependencies", []) or []:
+                dep_name, _, dep_ver = dep.partition("==")
+                ok, err = await self._pip_install(dep_name.strip(), dep_ver.strip() or None)
+                if not ok:
+                    logger.warning(
+                        "plugin_dependency_install_failed",
+                        plugin_id=plugin.plugin_id,
+                        dependency=dep,
+                        error=err,
+                    )
+            await maybe_await(plugin.on_install_async())
             await self._registry.record_download(record.plugin_id)
             self._installed[record.plugin_id] = plugin
+            self._instances[record.plugin_id] = plugin
             installed_version = record.version
+            # Enable the plugin so the on_enable hook fires once (4.7).
+            await self._registry.set_enabled(record.plugin_id, True, plugin=plugin)
 
         self._install_log.append({
             "action": "install",
@@ -188,12 +237,92 @@ class PluginMarketplace:
             version=installed_version,
         )
 
+    @staticmethod
+    def _is_importable(package_name: str) -> bool:
+        """Return True if *package_name* can already be imported."""
+        try:
+            importlib.import_module(package_name)
+            return True
+        except ImportError:
+            return False
+
+    @staticmethod
+    def _validate_package_name(package_name: str) -> None:
+        """Reject package names containing shell/flag metacharacters.
+
+        Pip parses extra argv tokens as flags/specs (``-r /etc/passwd``,
+        PEP508 options), so any name not matching the strict allowlist is
+        rejected before reaching the subprocess.  The name is always passed as
+        a single argv element (never a shell string).
+        """
+        if not package_name or not _PACKAGE_NAME_RE.match(package_name):
+            raise ValueError(
+                f"Invalid package name '{package_name}'. Package names must "
+                f"match ^[A-Za-z0-9][A-Za-z0-9._-]*$ (no spaces, '/', ';', "
+                f"'=', ':' or leading '-')."
+            )
+
+    async def _pip_install(
+        self, package_name: str, version: str | None = None
+    ) -> tuple[bool, str]:
+        """Install *package_name* via pip in a subprocess (never a shell).
+
+        Uses a list of arguments and ``asyncio.create_subprocess_exec`` so no
+        shell interpolation can occur (no shell-injection surface).  The package
+        name is validated against a strict allowlist and, when a version is
+        supplied, pinned with ``==version`` so unpinned/arbitrary specs cannot
+        be installed.  Enforces a 300s timeout and captures stderr.
+        """
+        self._validate_package_name(package_name)
+        if version is not None:
+            self._validate_package_name(version)
+
+        args = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-input",
+        ]
+        spec = f"{package_name}=={version}" if version else package_name
+        args.append(spec)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+        except asyncio.TimeoutError:
+            logger.warning("plugin_pip_install_timeout", package=package_name)
+            return False, f"pip install timed out after 300s for '{package_name}'"
+        except Exception as exc:
+            logger.warning(
+                "plugin_pip_install_error", package=package_name, error=str(exc)
+            )
+            return False, f"pip install failed for '{package_name}': {exc}"
+
+        if proc.returncode != 0:
+            err = (stderr or b"").decode("utf-8", "replace")[:500]
+            logger.warning(
+                "plugin_pip_install_failed",
+                package=package_name,
+                returncode=proc.returncode,
+                stderr=err,
+            )
+            return False, err or f"pip install failed (rc={proc.returncode})"
+        logger.info("plugin_pip_install_ok", package=package_name)
+        return True, (stdout or b"").decode("utf-8", "replace")[:500]
+
     async def uninstall(self, plugin_id: str) -> InstallResult:
         """Uninstall a plugin."""
-        plugin = self._installed.get(plugin_id)
+        # Prefer the instance map so on_uninstall fires even for sources that
+        # were never stashed in the older ``_installed`` dict (4.7).
+        plugin = self._instances.get(plugin_id) or self._installed.get(plugin_id)
         if plugin is not None:
             try:
-                plugin.on_uninstall()
+                await maybe_await(plugin.on_uninstall_async())
             except Exception as exc:
                 logger.warning(
                     "plugin_lifecycle_hook_failed",
@@ -202,6 +331,7 @@ class PluginMarketplace:
                     error=str(exc),
                 )
             self._installed.pop(plugin_id, None)
+            self._instances.pop(plugin_id, None)
 
         record = await self._registry.unregister(plugin_id)
         if record is None:

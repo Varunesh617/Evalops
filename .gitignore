@@ -15,3 +15,7 @@ venv/
 .pytest_cache/
 htmlcov/
 .coverage
+
+# Plugin signing — never commit private keys
+backend/plugins/keys/*_priv.pem
+backend/plugins/keys/*.pem.secret

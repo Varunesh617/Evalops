@@ -250,6 +250,16 @@ export interface CounterfactualResponse {
 }
 
 export interface Recommendation {
+  category: string;
+  action: string;
+  impact: string;
+  difficulty: string;
+  snippet?: string;
+  rationale?: string;
+  priority: number;
+  change_type?: string | null;
+  estimated_cost_delta_usd?: number | null;
+  estimated_latency_delta_ms?: number | null;
   [key: string]: unknown;
 }
 
@@ -561,6 +571,59 @@ export const plugins = {
 };
 
 // Diagnosis
+export interface RealRunRequest {
+  trace_id?: string;
+  trajectory?: Record<string, unknown>;
+  change_type: string;
+  original_value?: unknown;
+  counterfactual_value?: unknown;
+  description?: string;
+  timeout_seconds?: number;
+}
+
+export interface RealRunResponse {
+  intervention: {
+    change_type: string;
+    original_value: unknown;
+    counterfactual_value: unknown;
+    description: string;
+  };
+  counterfactual_score: number;
+  improvement_delta: number;
+  confidence: number;
+  cost_usd: number;
+  latency_ms: number;
+  error: string | null;
+  original_step_scores: Record<string, number>;
+  counterfactual_step_scores: Record<string, number>;
+}
+
+export interface ApplyRecommendationRequest {
+  trace_id: string;
+  recommendation_id: string;
+  category?: string;
+  action?: string;
+  change_type?: string;
+  user_id?: string;
+}
+
+export interface AppliedRecommendationView {
+  id: string;
+  user_id: string;
+  trace_id: string;
+  recommendation_id: string;
+  category: string;
+  action: string;
+  change_type: string;
+  applied_at: string;
+  outcome_status: string;
+  measured_delta: number | null;
+  measured_cost_delta: number | null;
+  measured_latency_delta_ms: number | null;
+  outcome_notes: string;
+  metadata: Record<string, unknown>;
+}
+
 export const diagnosis = {
   counterfactual: (body: { trace_id?: string; trajectory?: Record<string, unknown> }) =>
     request<CounterfactualResponse>("/diagnosis/counterfactual", {
@@ -573,6 +636,33 @@ export const diagnosis = {
     request<TrendsResponse>(
       `/diagnosis/trends?time_window_days=${timeWindowDays}&bucket_days=${bucketDays}`,
     ),
+  historical: (timeWindowDays = 30, bucketDays = 1, page = 1, pageSize = 100) => {
+    const params = new URLSearchParams({
+      time_window_days: String(timeWindowDays),
+      bucket_days: String(bucketDays),
+      page: String(page),
+      page_size: String(pageSize),
+    });
+    return request<Record<string, unknown>>(`/diagnosis/historical?${params}`);
+  },
+  realRun: (body: RealRunRequest) =>
+    request<RealRunResponse>("/diagnosis/counterfactual/real", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  applyRecommendation: (body: ApplyRecommendationRequest) =>
+    request<Record<string, unknown>>("/diagnosis/recommendations/apply", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  listAppliedRecommendations: (userId = "default", page = 1, pageSize = 50) => {
+    const params = new URLSearchParams({
+      user_id: userId,
+      page: String(page),
+      page_size: String(pageSize),
+    });
+    return request<AppliedRecommendationView[]>(`/diagnosis/recommendations/applied?${params}`);
+  },
 };
 
 // Cost analysis

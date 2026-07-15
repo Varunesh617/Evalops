@@ -164,16 +164,44 @@ export default function DiagnosisPage() {
                 className="p-3 rounded-lg border border-zinc-100 dark:border-zinc-800"
               >
                 <p className="text-sm text-zinc-800 dark:text-zinc-200">
-                  {String(rec.title ?? rec.action ?? rec.description ?? `Recommendation ${i + 1}`)}
+                  {String(rec.action ?? rec.title ?? rec.description ?? `Recommendation ${i + 1}`)}
                 </p>
                 {rec.rationale != null && (
                   <p className="text-xs text-zinc-500 mt-1">{String(rec.rationale)}</p>
                 )}
-                {rec.priority != null && (
-                  <span className="inline-block mt-2 px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
-                    {String(rec.priority)}
-                  </span>
-                )}
+                <div className="flex flex-wrap items-center gap-2 mt-2">
+                  {rec.priority != null && (
+                    <span className="inline-block px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
+                      {String(rec.priority)}
+                    </span>
+                  )}
+                  {rec.estimated_cost_delta_usd != null && (
+                    <span
+                      className={`inline-block px-2 py-0.5 rounded-full text-xs font-medium ${
+                        rec.estimated_cost_delta_usd > 0
+                          ? "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400"
+                          : "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400"
+                      }`}
+                      title="Estimated cost change if applied"
+                    >
+                      {rec.estimated_cost_delta_usd >= 0 ? "+" : ""}
+                      ${rec.estimated_cost_delta_usd.toFixed(4)} cost
+                    </span>
+                  )}
+                  {rec.estimated_latency_delta_ms != null && (
+                    <span
+                      className={`inline-block px-2 py-0.5 rounded-full text-xs font-medium ${
+                        rec.estimated_latency_delta_ms > 0
+                          ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
+                          : "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400"
+                      }`}
+                      title="Estimated latency change if applied"
+                    >
+                      {rec.estimated_latency_delta_ms >= 0 ? "+" : ""}
+                      {rec.estimated_latency_delta_ms.toFixed(0)}ms
+                    </span>
+                  )}
+                </div>
               </div>
             ))}
             {recommendations.recommendations.length === 0 && (

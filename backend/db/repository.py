@@ -14,6 +14,7 @@ from sqlalchemy import String, cast, func, select
 from sqlalchemy.orm import DeclarativeBase
 
 from backend.db.models import (
+    AppliedRecommendation,
     EvalResult,
     Pipeline,
     PipelineRun,
@@ -566,3 +567,83 @@ class UserPreferenceRepository(BaseRepository[UserPreferenceState]):
             }
             return await self.create(record)
         return await self.update(user_id, {"preferences_json": preferences_json})
+
+
+# ---------------------------------------------------------------------------
+# AppliedRecommendation
+# ---------------------------------------------------------------------------
+
+
+class AppliedRecommendationRepository(BaseRepository[AppliedRecommendation]):
+    """Tracks applied recommendations and their measured outcomes."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        super().__init__(session, AppliedRecommendation)
+
+    async def list_for_user(
+        self, user_id: str, *, page: int = 1, page_size: int = 50
+    ) -> tuple[list[dict[str, Any]], int]:
+        offset = (page - 1) * page_size
+        total_stmt = select(func.count()).select_from(AppliedRecommendation).where(
+            AppliedRecommendation.user_id == user_id
+        )
+        total = (await self._session.execute(total_stmt)).scalar_one()
+        stmt = (
+            select(AppliedRecommendation)
+            .where(AppliedRecommendation.user_id == user_id)
+            .order_by(AppliedRecommendation.applied_at.desc())
+            .offset(offset)
+            .limit(page_size)
+        )
+        result = await self._session.execute(stmt)
+        return [_obj_to_dict(o) for o in result.scalars().all()], total
+
+    async def get_for_recommendation(
+        self, recommendation_id: str
+    ) -> dict[str, Any] | None:
+        """Return the applied record for a unique recommendation id, if any."""
+        stmt = select(AppliedRecommendation).where(
+            AppliedRecommendation.recommendation_id == recommendation_id
+        )
+        result = await self._session.execute(stmt)
+        obj = result.scalar_one_or_none()
+        return _obj_to_dict(obj) if obj is not None else None
+
+    async def update_outcome(
+        self,
+        recommendation_id: str,
+        *,
+        outcome_status: str,
+        measured_delta: float | None = None,
+        measured_cost_delta: float | None = None,
+        measured_latency_delta_ms: float | None = None,
+        outcome_notes: str = "",
+    ) -> dict[str, Any] | None:
+        """Record the outcome of an already-applied recommendation.
+
+        The *recommendation_id* is the application's unique id (also stored as
+        the synthetic primary key), so we look the row up by that column and
+        then update it by primary key.
+        """
+        stmt = select(AppliedRecommendation).where(
+            AppliedRecommendation.recommendation_id == recommendation_id
+        )
+        result = await self._session.execute(stmt)
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return await self.update(
+            row.id,
+            {
+                "outcome_status": outcome_status,
+                "measured_delta": measured_delta,
+                "measured_cost_delta": measured_cost_delta,
+                "measured_latency_delta_ms": measured_latency_delta_ms,
+                "outcome_notes": outcome_notes,
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# AppliedRecommendation (single canonical definition)
+# ---------------------------------------------------------------------------

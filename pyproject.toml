@@ -53,6 +53,9 @@ dev = [
     "mypy>=1.10.0",
     "pre-commit>=3.8.0",
 ]
+plugins = [
+    "cryptography>=42.0.0",
+]
 test = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
