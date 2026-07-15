@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from typing import Any
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -116,23 +117,21 @@ class PluginDiscovery:
         return self._fetch_pypi_package(package_name)
 
     def _discover_pypi_packages(self, prefix: str) -> list[str]:
-        """Use the PyPI simple index to discover packages matching a prefix."""
+        """Use the PyPI simple index to discover packages matching a prefix.
+
+        The ``/simple/`` endpoint returns HTML (an ``<a>`` list), not JSON, so
+        we parse it with the stdlib :class:`HTMLParser` and extract the package
+        name from each anchor's ``href`` path.
+        """
         search_url = "https://pypi.org/simple/"
         try:
-            request = Request(search_url, headers={"Accept": "application/json"})
+            request = Request(search_url, headers={"Accept": "text/html"})
             with urlopen(request, timeout=10) as response:
-                data = json.loads(response.read())
-            if isinstance(data, dict):
-                names = data.get("projects", [])
-            elif isinstance(data, list):
-                names = data
-            else:
-                names = []
-            return [
-                n for n in names
-                if isinstance(n, str) and n.startswith(prefix)
-            ]
-        except (URLError, json.JSONDecodeError, OSError) as exc:
+                body = response.read().decode("utf-8")
+            parser = _SimpleIndexParser()
+            parser.feed(body)
+            return [n for n in parser.names if n.startswith(prefix)]
+        except (URLError, OSError, UnicodeDecodeError, ValueError) as exc:
             logger.warning("pypi_simple_index_failed", error=str(exc))
             return []
 
@@ -189,3 +188,19 @@ class PluginDiscovery:
     def invalidate_cache(self) -> None:
         self._pypi_cache = DiscoveryCache()
         self._entry_point_cache = DiscoveryCache()
+
+
+class _SimpleIndexParser(HTMLParser):
+    """Collect package names from the PyPI simple index ``<a>`` list."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.names: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "a":
+            for key, value in attrs:
+                if key == "href" and value:
+                    name = value.rstrip("/").split("/")[-1]
+                    if name:
+                        self.names.append(name)

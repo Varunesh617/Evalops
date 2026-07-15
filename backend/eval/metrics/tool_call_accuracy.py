@@ -20,6 +20,7 @@ class ToolCallAccuracyMetric(BaseMetric):
     """
 
     name = "tool_call_accuracy"
+    cpu_bound = False
     description = (
         "Measures whether tool calls are correct and complete. "
         "1.0 = all tool calls perfectly match expectations, 0.0 = none match."

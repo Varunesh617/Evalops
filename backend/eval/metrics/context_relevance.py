@@ -6,8 +6,14 @@ import structlog
 
 from backend.eval.metrics.base import BaseMetric
 from backend.eval.models import Step, StepScore, StepType, Trajectory
+from backend.eval.similarity import (
+    EmbeddingsUnavailableError,
+    embed_similarity_to_chunks,
+)
 
 logger = structlog.get_logger(__name__)
+
+_VALID_SIM_MODES = ("token", "embedding", "hybrid")
 
 
 class ContextRelevanceMetric(BaseMetric):
@@ -26,9 +32,25 @@ class ContextRelevanceMetric(BaseMetric):
         "1.0 = all retrieved chunks are highly relevant, 0.0 = none are relevant."
     )
 
-    def __init__(self, *, min_relevance: float = 0.05, **config) -> None:
-        super().__init__(min_relevance=min_relevance, **config)
+    def __init__(
+        self,
+        *,
+        min_relevance: float = 0.05,
+        similarity_mode: str = "token",
+        **config,
+    ) -> None:
+        if similarity_mode not in _VALID_SIM_MODES:
+            raise ValueError(
+                f"similarity_mode must be one of {_VALID_SIM_MODES}, "
+                f"got {similarity_mode!r}"
+            )
+        super().__init__(
+            min_relevance=min_relevance,
+            similarity_mode=similarity_mode,
+            **config,
+        )
         self.min_relevance = min_relevance
+        self.similarity_mode = similarity_mode
 
     # ------------------------------------------------------------------
     # Per-step scoring
@@ -54,7 +76,7 @@ class ContextRelevanceMetric(BaseMetric):
                 details="Retrieval step with no context chunks.",
             )
 
-        chunk_scores = [self.token_overlap(query, chunk) for chunk in chunks]
+        chunk_scores = [self._similarity(query, chunk) for chunk in chunks]
         avg_score = sum(chunk_scores) / len(chunk_scores)
         relevant_count = sum(
             1 for s in chunk_scores if s >= self.min_relevance
@@ -99,12 +121,32 @@ class ContextRelevanceMetric(BaseMetric):
             return self._score_trajectory_level(trajectory)
         return round(sum(retrieval_scores) / len(retrieval_scores), 4)
 
+    def _similarity(self, query: str, chunk: str) -> float:
+        """Mode-aware similarity between *query* and a single *chunk*.
+
+        ``"token"`` / fallback → Jaccard token overlap. ``"embedding"`` → cosine
+        via the embedding backend. ``"hybrid"`` → max of the two. Falls back to
+        token overlap when the embedding backend is unavailable.
+        """
+        if self.similarity_mode == "token":
+            return self.token_overlap(query, chunk)
+        try:
+            sims = embed_similarity_to_chunks(query, [chunk])
+        except EmbeddingsUnavailableError:
+            sims = []
+        if sims:
+            cos = sims[0]
+            if self.similarity_mode == "embedding":
+                return cos
+            return max(self.token_overlap(query, chunk), cos)
+        return self.token_overlap(query, chunk)
+
     def _score_trajectory_level(self, trajectory: Trajectory) -> float:
         """Score trajectory-level retrieved_context when no retrieval steps exist."""
         chunks = trajectory.retrieved_context
         if not chunks or not trajectory.query:
             return 0.0
         chunk_scores = [
-            self.token_overlap(trajectory.query, chunk) for chunk in chunks
+            self._similarity(trajectory.query, chunk) for chunk in chunks
         ]
         return round(sum(chunk_scores) / len(chunk_scores), 4)

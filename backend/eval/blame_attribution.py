@@ -18,6 +18,7 @@ import structlog
 
 from backend.core.config import StepStatus
 from backend.core.tracer import Trajectory, TrajectoryStep
+from backend.eval.llm_judge import LLMJudgeClient, LLMJudgeError
 
 logger = structlog.get_logger(__name__)
 
@@ -73,6 +74,7 @@ class BlameReport:
     remediation: list[str] = field(default_factory=list)
     counterfactuals: list[dict[str, Any]] = field(default_factory=list)
     rubric: dict[str, Any] = field(default_factory=dict)
+    llm_judgement: dict[str, Any] = field(default_factory=dict)
     score: float = 0.0  # 0.0 = severe failure, 1.0 = fully healthy
 
     def to_dict(self) -> dict[str, Any]:
@@ -95,6 +97,7 @@ class BlameReport:
             "remediation": self.remediation,
             "counterfactuals": self.counterfactuals,
             "rubric": self.rubric,
+            "llm_judgement": self.llm_judgement,
             "score": self.score,
         }
 
@@ -413,6 +416,17 @@ class BlameAttributionEngine:
         remediation = self._suggest_remediation(root_step, failure_mode)
         rubric = self._build_rubric(trajectory, root_step, failure_mode)
 
+        # Optional LLM-as-judge: only runs when explicitly enabled. Any failure
+        # degrades gracefully — it MUST NOT break the overall analysis.
+        llm_judgement: dict[str, Any] = {}
+        judge = LLMJudgeClient()
+        if judge.enabled:
+            try:
+                llm_judgement = judge.judge(rubric)
+            except LLMJudgeError as exc:
+                logger.warning("blame_llm_judge_failed", error=str(exc))
+                llm_judgement = {}
+
         # Score: 1.0 minus penalties for each failed / propagated step
         penalty = 0.0
         for link in cascade:
@@ -436,6 +450,7 @@ class BlameAttributionEngine:
             remediation=remediation,
             counterfactuals=counterfactuals,
             rubric=rubric,
+            llm_judgement=llm_judgement,
             score=round(final_score, 3),
         )
 

@@ -56,6 +56,7 @@ class ParetoResult(BaseModel):
     pareto_front: list[ParetoPoint] = Field(default_factory=list)
     frontier_curves: dict[str, FrontierCurve] = Field(default_factory=dict)
     total_trials: int = 0
+    trials_pruned: int = 0
     pareto_ratio: float = 0.0
     total_duration_seconds: float = 0.0
     objective_names: list[str] = Field(default_factory=list)
@@ -235,6 +236,7 @@ class ParetoOptimizer:
         log = logger.bind(study=self._study_name, n_trials=self._n_trials)
         log.info("pareto_optimizer.started")
 
+        pruned = 0
         for trial_num in range(self._n_trials):
             trial = study.ask()
             config = define_search_space(trial)
@@ -250,49 +252,86 @@ class ParetoOptimizer:
                 study.tell(trial, states=[optuna.trial.TrialState.FAIL] * 3)
                 continue
 
-            # quality (maximise), cost (minimise), latency (minimise)
-            study.tell(trial, [outcome.quality_score, outcome.cost_usd, outcome.latency_ms])
+            # Report intermediate values so the pruner can cut unpromising trials.
+            # We use quality as the pruning signal (higher is better).
+            # NOTE: Optuna's Trial.report is unsupported in multi-objective
+            # studies, so guard against NotImplementedError — pruning simply
+            # stays dormant in that case.
+            intermediate = outcome.metadata.get("intermediate_values", [])
+            pruned_this_trial = False
+            for step_idx, val in enumerate(intermediate):
+                try:
+                    trial.report(val, step=step_idx)
+                except NotImplementedError:
+                    break
+                if trial.should_prune():
+                    study.tell(
+                        trial,
+                        states=[optuna.trial.TrialState.PRUNED] * 3,
+                    )
+                    pruned += 1
+                    pruned_this_trial = True
+                    log.info("pareto_optimizer.trial_pruned", trial=trial_num)
+                    break
+            if pruned_this_trial:
+                continue
+            else:
+                # Not pruned — record the full multi-objective result.
+                # quality (maximise), cost (minimise), latency (minimise)
+                study.tell(
+                    trial,
+                    [outcome.quality_score, outcome.cost_usd, outcome.latency_ms],
+                )
+                all_evals.append(
+                    {
+                        "trial": trial_num,
+                        "cost_usd": outcome.cost_usd,
+                        "quality_score": outcome.quality_score,
+                        "latency_ms": outcome.latency_ms,
+                        "config": config.model_dump(mode="json"),
+                    }
+                )
 
-            all_evals.append(
-                {
-                    "trial": trial_num,
-                    "cost_usd": outcome.cost_usd,
-                    "quality_score": outcome.quality_score,
-                    "latency_ms": outcome.latency_ms,
-                    "config": config.model_dump(mode="json"),
-                }
-            )
-
-            log.info(
-                "pareto_optimizer.trial_completed",
-                trial=trial_num,
-                quality=round(outcome.quality_score, 4),
-                cost=round(outcome.cost_usd, 4),
-                latency=round(outcome.latency_ms, 1),
-            )
+                log.info(
+                    "pareto_optimizer.trial_completed",
+                    trial=trial_num,
+                    quality=round(outcome.quality_score, 4),
+                    cost=round(outcome.cost_usd, 4),
+                    latency=round(outcome.latency_ms, 1),
+                )
 
         total_duration = time.monotonic() - start
 
-        # Collect Pareto-optimal trials from the study
+        # NSGA-II already returns only the non-dominated set in study.best_trials,
+        # so re-running O(n^2) find_pareto_front is redundant. Iterate directly.
         best_trials = study.best_trials
-        objectives = np.array(
-            [[t.values[0], t.values[1], t.values[2]] for t in best_trials]
-        )
-        pareto_indices = find_pareto_front(objectives) if len(objectives) > 0 else []
 
         pareto_points: list[ParetoPoint] = []
-        for idx in pareto_indices:
-            bt = best_trials[idx]
-            config = define_search_space(bt)
-            pareto_points.append(
-                ParetoPoint(
-                    config=config,
-                    cost_usd=bt.values[1],
-                    quality_score=bt.values[0],
-                    latency_ms=bt.values[2],
-                    trial_number=bt.number,
+        for bt in best_trials:
+            try:
+                if bt.values is None or len(bt.values) < 3:
+                    log.warning(
+                        "pareto_optimizer.skipping_incomplete_trial",
+                        trial=bt.number,
+                        values=bt.values,
+                    )
+                    continue
+                config = define_search_space(bt)
+                pareto_points.append(
+                    ParetoPoint(
+                        config=config,
+                        cost_usd=bt.values[1],
+                        quality_score=bt.values[0],
+                        latency_ms=bt.values[2],
+                        trial_number=bt.number,
+                    )
                 )
-            )
+            except Exception:
+                logger.exception(
+                    "pareto_optimizer.trial_reconstruction_failed",
+                    trial=getattr(bt, "number", None),
+                )
+                continue
 
         frontier_curves = {
             "cost_quality": build_cost_quality_curve(pareto_points, all_evals),
@@ -306,6 +345,7 @@ class ParetoOptimizer:
         log.info(
             "pareto_optimizer.completed",
             total_trials=total_completed,
+            trials_pruned=pruned,
             pareto_points=len(pareto_points),
             pareto_ratio=round(pareto_ratio, 4),
             total_seconds=round(total_duration, 2),
@@ -315,6 +355,7 @@ class ParetoOptimizer:
             pareto_front=pareto_points,
             frontier_curves=frontier_curves,
             total_trials=total_completed,
+            trials_pruned=pruned,
             pareto_ratio=pareto_ratio,
             total_duration_seconds=total_duration,
             objective_names=["quality_score", "cost_usd", "latency_ms"],

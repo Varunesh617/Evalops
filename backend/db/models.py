@@ -331,3 +331,86 @@ class UserConfig(Base):
         Index("ix_user_configs_user_id", "user_id"),
         Index("ix_user_configs_pipeline_id", "pipeline_id"),
     )
+
+
+# ---------------------------------------------------------------------------
+# PluginState
+# ---------------------------------------------------------------------------
+
+
+class PluginState(Base):
+    """Persisted state of an installed plugin (mirror of PluginRegistry)."""
+
+    __tablename__ = "plugin_states"
+
+    plugin_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    version: Mapped[str] = mapped_column(String(64), nullable=False)
+    author: Mapped[str] = mapped_column(String(256), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    plugin_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    entry_point: Mapped[str] = mapped_column(String(512), default="")
+    config_schema: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    dependencies: Mapped[list[str]] = mapped_column(JSON, default=list)
+    downloads: Mapped[int] = mapped_column(Integer, default=0)
+    usage_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_used: Mapped[float] = mapped_column(Float, default=0.0)
+    enabled: Mapped[bool] = mapped_column(default=True)
+    installed_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (Index("ix_plugin_states_enabled", "enabled"),)
+
+
+# ---------------------------------------------------------------------------
+# TuningPreset
+# ---------------------------------------------------------------------------
+
+
+class TuningPreset(Base):
+    """A persisted custom tuning preset."""
+
+    __tablename__ = "tuning_presets"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    is_builtin: Mapped[bool] = mapped_column(default=False)
+    domain: Mapped[str] = mapped_column(String(32), default="general")
+    user_id: Mapped[str] = mapped_column(String(256), default="default")
+    preferences_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (Index("ix_tuning_presets_user_id", "user_id"),)
+
+
+# ---------------------------------------------------------------------------
+# UserPreferenceState
+# ---------------------------------------------------------------------------
+
+
+class UserPreferenceState(Base):
+    """Persisted user tuning preferences keyed by user_id."""
+
+    __tablename__ = "user_preference_states"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    preferences_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (Index("ix_user_preference_states_user_id", "user_id"),)

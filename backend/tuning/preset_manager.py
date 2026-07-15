@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 import structlog
 from pydantic import BaseModel, Field
@@ -15,6 +16,9 @@ from backend.tuning.user_preferences import (
     UserPreferences,
     get_domain_defaults,
 )
+
+if TYPE_CHECKING:
+    from backend.db.repository import TuningPresetRepository, UserPreferenceRepository
 
 logger = structlog.get_logger(__name__)
 
@@ -144,6 +148,50 @@ class PresetManager:
     def __init__(self) -> None:
         _ensure_builtins()
         self._custom: dict[str, TuningPreset] = {}
+        self._preset_repo: TuningPresetRepository | None = None
+        self._pref_repo: UserPreferenceRepository | None = None
+
+    def set_db_repos(
+        self,
+        preset_repo: TuningPresetRepository | None,
+        pref_repo: UserPreferenceRepository | None,
+    ) -> None:
+        """Wire optional DB repositories. When ``None`` the manager stays in-memory."""
+        self._preset_repo = preset_repo
+        self._pref_repo = pref_repo
+        if preset_repo is not None:
+            import asyncio
+
+            try:
+                loop_running = asyncio.get_event_loop().is_running()
+            except RuntimeError:
+                loop_running = False
+            if not loop_running:
+                loop = asyncio.new_event_loop()
+                try:
+                    rows = loop.run_until_complete(preset_repo.list_for_user("default"))
+                    for row in rows:
+                        self._rehydrate_preset(row)
+                except Exception as exc:
+                    logger.warning("preset_rehydrate_failed", error=str(exc))
+                finally:
+                    loop.close()
+
+    def _rehydrate_preset(self, row: dict[str, Any]) -> None:
+        """Rebuild a custom preset in memory from a DB row (no further DB writes)."""
+        try:
+            prefs = UserPreferences.model_validate(row.get("preferences_json", {}))
+        except Exception:
+            return
+        preset = TuningPreset(
+            id=row["id"],
+            name=row.get("name", ""),
+            description=row.get("description", ""),
+            is_builtin=bool(row.get("is_builtin", False)),
+            domain=DomainType(row.get("domain", "general")),
+            preferences=prefs,
+        )
+        self._custom[preset.id] = preset
 
     def list_presets(self) -> list[TuningPreset]:
         """Return all available presets (built-in + custom)."""
@@ -154,7 +202,7 @@ class PresetManager:
         """Get a preset by ID."""
         return _BUILTIN_PRESETS.get(preset_id) or self._custom.get(preset_id)
 
-    def create_preset(
+    async def create_preset(
         self,
         name: str,
         preferences: UserPreferences,
@@ -170,23 +218,51 @@ class PresetManager:
             preferences=preferences,
         )
         self._custom[preset.id] = preset
+        if self._preset_repo is not None:
+            try:
+                await self._preset_repo.create({
+                    "id": preset.id,
+                    "name": preset.name,
+                    "description": preset.description,
+                    "is_builtin": preset.is_builtin,
+                    "domain": preset.domain.value,
+                    "user_id": "default",
+                    "preferences_json": preset.preferences.model_dump(mode="json"),
+                })
+            except Exception as exc:
+                logger.warning("preset_create_persist_failed", preset_id=preset.id, error=str(exc))
         logger.info("preset_created", preset_id=preset.id, name=name)
         return preset
 
-    def save_preset(self, preset: TuningPreset) -> TuningPreset:
+    async def save_preset(self, preset: TuningPreset) -> TuningPreset:
         """Update an existing custom preset."""
         if preset.is_builtin:
             raise ValueError(f"Cannot modify built-in preset '{preset.name}'")
         preset.updated_at = datetime.now(UTC)
         self._custom[preset.id] = preset
+        if self._preset_repo is not None:
+            try:
+                await self._preset_repo.update(preset.id, {
+                    "name": preset.name,
+                    "description": preset.description,
+                    "domain": preset.domain.value,
+                    "preferences_json": preset.preferences.model_dump(mode="json"),
+                })
+            except Exception as exc:
+                logger.warning("preset_save_persist_failed", preset_id=preset.id, error=str(exc))
         logger.info("preset_saved", preset_id=preset.id, name=preset.name)
         return preset
 
-    def delete_preset(self, preset_id: str) -> bool:
+    async def delete_preset(self, preset_id: str) -> bool:
         """Delete a custom preset. Built-in presets cannot be deleted."""
         if preset_id in _BUILTIN_PRESETS:
             raise ValueError(f"Cannot delete built-in preset '{preset_id}'")
         removed = self._custom.pop(preset_id, None)
+        if removed and self._preset_repo is not None:
+            try:
+                await self._preset_repo.delete_custom(preset_id)
+            except Exception as exc:
+                logger.warning("preset_delete_persist_failed", preset_id=preset_id, error=str(exc))
         if removed:
             logger.info("preset_deleted", preset_id=preset_id)
         return removed is not None

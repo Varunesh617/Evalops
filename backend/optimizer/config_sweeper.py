@@ -75,7 +75,12 @@ class EvalFunction(Protocol):
 
 @dataclass
 class EvalOutcome:
-    """Raw output from a single pipeline evaluation run."""
+    """Raw output from a single pipeline evaluation run.
+
+    ``metadata`` may carry ``intermediate_values`` — an ordered list of quality
+    estimates (one per pipeline stage) — which the sweeper reports to Optuna's
+    pruner via ``trial.report``. If absent, pruning stays dormant.
+    """
 
     quality_score: float
     cost_usd: float
@@ -276,6 +281,7 @@ class ConfigSweeper:
         log = logger.bind(study=self._study_name, n_trials=self._n_trials)
         log.info("config_sweep.started")
 
+        pruned = 0
         for trial_num in range(self._n_trials):
             trial = study.ask()
             config = define_search_space(trial)
@@ -302,6 +308,29 @@ class ConfigSweeper:
                 max_cost_usd=self._max_cost_usd,
                 max_latency_ms=self._max_latency_ms,
             )
+
+            # Report intermediate values so the pruner can cut unpromising trials.
+            intermediate = outcome.metadata.get("intermediate_values", [])
+            pruned_this_trial = False
+            for step_idx, val in enumerate(intermediate):
+                trial.report(val, step=step_idx)
+                if trial.should_prune():
+                    study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+                    pruned += 1
+                    pruned_this_trial = True
+                    log.info("config_sweep.trial_pruned", trial=trial_num)
+                    break
+
+            if pruned_this_trial:
+                continue
+
+            # Persist the per-trial scalars BEFORE finishing the trial so that
+            # study.best_trial.user_attrs (read later in the SweepResult)
+            # returns real values.
+            trial.set_user_attr("quality_score", outcome.quality_score)
+            trial.set_user_attr("cost_usd", outcome.cost_usd)
+            trial.set_user_attr("latency_ms", outcome.latency_ms)
+
             study.tell(trial, composite)
 
             duration = time.monotonic() - trial_start
@@ -329,14 +358,18 @@ class ConfigSweeper:
         best = study.best_trial
         best_config = define_search_space(best)
 
-        param_importances = optuna.importance.get_param_importances(study)
+        try:
+            param_importances = optuna.importance.get_param_importances(study)
+        except Exception:  # pragma: no cover - optional sklearn dep
+            logger.warning("config_sweep.param_importance_unavailable")
+            param_importances = {}
 
         completed = len(all_trials)
-        pruned = sum(1 for t in all_trials if False)  # placeholder; pruner counts via study
 
         log.info(
             "config_sweep.completed",
             completed=completed,
+            trials_pruned=pruned,
             best_score=round(best.value, 4) if best.value else 0,
             total_seconds=round(total_duration, 2),
         )

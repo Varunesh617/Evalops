@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import structlog
 from fastapi import APIRouter, HTTPException
 
+from backend.db.repository import TuningPresetRepository, UserPreferenceRepository
+from backend.db.session import get_session_factory
 from backend.tuning.config_schema import ConfigSchemaGenerator
 from backend.tuning.filter_configurator import FilterConfigurator
 from backend.tuning.metric_selector import MetricSelector
@@ -37,6 +40,47 @@ _opt_configurator = OptimizationConfigurator()
 _preset_manager = PresetManager()
 _schema_gen = ConfigSchemaGenerator()
 
+# Wire optional DB persistence when DATABASE_URL is configured.
+_database_url = os.environ.get("DATABASE_URL")
+if _database_url:
+    try:
+        _factory = get_session_factory(_database_url)
+        _preset_manager.set_db_repos(
+            TuningPresetRepository(_factory()),
+            UserPreferenceRepository(_factory()),
+        )
+    except Exception as exc:
+        logger.warning("tuning_db_init_failed", error=str(exc))
+
+
+async def _persist_prefs(prefs: UserPreferences) -> None:
+    """Persist user preferences to the DB if a repository is wired."""
+    repo = _preset_manager._pref_repo  # type: ignore[attr-defined]
+    if repo is None:
+        return
+    try:
+        await repo.upsert(prefs.user_id, preferences_json=prefs.model_dump(mode="json"))
+    except Exception as exc:
+        logger.warning("preferences_persist_failed", user_id=prefs.user_id, error=str(exc))
+
+
+async def _load_prefs(user_id: str) -> UserPreferences | None:
+    """Load user preferences from the DB if a repository is wired."""
+    repo = _preset_manager._pref_repo  # type: ignore[attr-defined]
+    if repo is None:
+        return None
+    try:
+        row = await repo.get_for_user(user_id)
+    except Exception as exc:
+        logger.warning("preferences_load_failed", user_id=user_id, error=str(exc))
+        return None
+    if row is None:
+        return None
+    try:
+        return UserPreferences.model_validate(row.get("preferences_json", {}))
+    except Exception:
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Preferences
@@ -52,6 +96,11 @@ async def get_preferences(user_id: str = "default", domain: str = "general") -> 
             status_code=422,
             detail=f"Invalid domain: {domain}. Valid: {[d.value for d in DomainType]}",
         )
+    # Prefer a DB-backed value when available; otherwise fall back to in-memory.
+    db_prefs = await _load_prefs(user_id)
+    if db_prefs is not None:
+        _pref_manager.save(db_prefs)
+        return db_prefs.model_dump(mode="json")
     prefs = _pref_manager.get_or_create(user_id, domain_enum)
     return prefs.model_dump(mode="json")
 
@@ -60,6 +109,7 @@ async def get_preferences(user_id: str = "default", domain: str = "general") -> 
 async def update_preferences(body: UserPreferences) -> dict[str, Any]:
     """Update user preferences."""
     saved = _pref_manager.save(body)
+    await _persist_prefs(saved)
     logger.info("tuning_preferences_updated", user_id=saved.user_id)
     return saved.model_dump(mode="json")
 
@@ -70,7 +120,7 @@ async def export_preferences(
     format: str = "yaml",
 ) -> dict[str, str]:
     """Export user preferences as YAML or JSON."""
-    prefs = _pref_manager.get(user_id)
+    prefs = await _load_prefs(user_id) or _pref_manager.get(user_id)
     if prefs is None:
         raise HTTPException(status_code=404, detail="No preferences found for this user.")
     if format == "json":
@@ -90,6 +140,7 @@ async def import_preferences(body: dict[str, Any]) -> dict[str, Any]:
         prefs = UserPreferences.from_json(content)
     prefs.user_id = user_id
     saved = _pref_manager.save(prefs)
+    await _persist_prefs(saved)
     return saved.model_dump(mode="json")
 
 
@@ -265,7 +316,7 @@ async def create_preset(
             status_code=422,
             detail=f"Invalid domain: {domain}. Valid: {[d.value for d in DomainType]}",
         )
-    preset = _preset_manager.create_preset(
+    preset = await _preset_manager.create_preset(
         name,
         prefs,
         description=description,

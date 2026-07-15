@@ -82,6 +82,7 @@ class PluginLoader:
         if self._sandbox is not None:
             cls_module = inspect.getmodule(cls)
             if cls_module is not None:
+                cls_module.__dict__["__builtins__"] = self._sandbox.restricted_builtins()
                 self._sandbox.enforce_imports(cls_module)
 
         return plugin
@@ -128,6 +129,9 @@ class PluginLoader:
         sys.modules[module_name] = module
         try:
             if self._sandbox is not None:
+                # Restrict what the plugin module can do at runtime by
+                # swapping in the sandboxed builtins before execution.
+                module.__dict__["__builtins__"] = self._sandbox.restricted_builtins()
                 with self._sandbox.timed_execution(module_name):
                     spec.loader.exec_module(module)  # type: ignore[union-attr]
             else:

@@ -115,6 +115,71 @@ class TestBaseMetricEvaluate:
 
 
 # ---------------------------------------------------------------------------
+# irrelevant_weight tests (Task 2.7)
+# ---------------------------------------------------------------------------
+
+
+class TestIrrelevantWeight:
+    def _make_metric(self, irrelevant_weight):
+        class WMetric(BaseMetric):
+            name = "w_metric"
+
+            def __init__(self, **kw):
+                super().__init__(**kw)
+
+            def score_step(self, trajectory, step):
+                # Relevant step (id 0) scores 0.8, irrelevant (id 1) 0.4.
+                score = 0.8 if step.step_id == 0 else 0.4
+                return StepScore(
+                    step_id=step.step_id,
+                    metric_name=self.name,
+                    score=float(score),
+                )
+
+            def _is_relevant(self, step_score):
+                # First step is relevant (weight 1.0), second is not.
+                return step_score.step_id == 0
+
+        return WMetric(irrelevant_weight=irrelevant_weight)
+
+    def test_invalid_weight_raises(self):
+        with pytest.raises(ValueError, match="irrelevant_weight"):
+            self._make_metric(2.0)
+        with pytest.raises(ValueError, match="irrelevant_weight"):
+            self._make_metric(-0.5)
+
+    def test_default_weight_zero_contribution(self):
+        # irrelevant step contributes 0 -> overall = score of relevant step.
+        m = self._make_metric(0.0)
+        steps = [
+            Step(step_id=0, step_type=StepType.RETRIEVAL),
+            Step(step_id=1, step_type=StepType.ANSWER),
+        ]
+        # relevant=0.8 (weight 1), irrelevant weight 0 -> only relevant counts
+        result = m.evaluate(_traj(steps=steps))
+        assert result.overall_score == pytest.approx(0.8)
+
+    def test_weight_one_equals_simple_mean(self):
+        m = self._make_metric(1.0)
+        steps = [
+            Step(step_id=0, step_type=StepType.RETRIEVAL),
+            Step(step_id=1, step_type=StepType.ANSWER),
+        ]
+        result = m.evaluate(_traj(steps=steps))
+        assert result.overall_score == pytest.approx(0.6)
+
+    def test_weight_zero_point_twentyfive_default(self):
+        m = self._make_metric(0.25)
+        steps = [
+            Step(step_id=0, step_type=StepType.RETRIEVAL),
+            Step(step_id=1, step_type=StepType.ANSWER),
+        ]
+        # (0.8*1 + 0.4*0.25) / (1 + 0.25) = 0.9/1.25
+        result = m.evaluate(_traj(steps=steps))
+        assert result.overall_score == pytest.approx(0.9 / 1.25)
+
+
+# ---------------------------------------------------------------------------
 # FaithfulnessMetric tests
 # ---------------------------------------------------------------------------
 
@@ -162,6 +227,70 @@ class TestFaithfulnessMetric:
     def test_custom_threshold(self):
         m = FaithfulnessMetric(overlap_threshold=0.5)
         assert m.overlap_threshold == 0.5
+
+    def test_invalid_similarity_mode(self):
+        with pytest.raises(ValueError, match="similarity_mode"):
+            FaithfulnessMetric(similarity_mode="bogus")
+
+    def test_token_mode_is_default(self):
+        m = FaithfulnessMetric()
+        assert m.similarity_mode == "token"
+
+    def test_embedding_mode_falls_back_when_unavailable(self, monkeypatch):
+        # Force the embedding backend to be unavailable; embedding mode must
+        # fall back to token overlap without raising.
+        import backend.eval.similarity as sim
+
+        def _boom(*a, **k):
+            raise sim.EmbeddingsUnavailableError("forced")
+
+        monkeypatch.setattr(sim.EmbeddingBackend, "_load_local_model", staticmethod(_boom))
+        m = FaithfulnessMetric(similarity_mode="embedding")
+        traj = _traj(
+            steps=[
+                Step(
+                    step_id=0,
+                    step_type=StepType.RETRIEVAL,
+                    context_chunks=["Python is a programming language"],
+                )
+            ],
+            retrieved_context=["Python is a programming language"],
+        )
+        step = Step(
+            step_id=1,
+            step_type=StepType.ANSWER,
+            output_text="Python is a programming language.",
+        )
+        result = m.score_step(traj, step)
+        assert 0.0 <= result.score <= 1.0
+
+    def test_hybrid_mode_supported_on_semantic_match(self, monkeypatch):
+        # When embeddings are unavailable, hybrid must still flag a claim as
+        # supported when token overlap is high (regression-safe).
+        import backend.eval.similarity as sim
+
+        def _boom(*a, **k):
+            raise sim.EmbeddingsUnavailableError("forced")
+
+        monkeypatch.setattr(sim.EmbeddingBackend, "_load_local_model", staticmethod(_boom))
+        m = FaithfulnessMetric(similarity_mode="hybrid")
+        traj = _traj(
+            steps=[
+                Step(
+                    step_id=0,
+                    step_type=StepType.RETRIEVAL,
+                    context_chunks=["The Eiffel Tower is located in Paris"],
+                )
+            ],
+            retrieved_context=["The Eiffel Tower is located in Paris"],
+        )
+        step = Step(
+            step_id=1,
+            step_type=StepType.ANSWER,
+            output_text="The Eiffel Tower is located in Paris.",
+        )
+        result = m.score_step(traj, step)
+        assert result.score >= 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +341,42 @@ class TestContextRelevanceMetric:
             retrieved_context=["Python programming"],
         ))
         assert result.overall_score >= 0
+
+    def test_invalid_similarity_mode(self):
+        with pytest.raises(ValueError, match="similarity_mode"):
+            ContextRelevanceMetric(similarity_mode="bogus")
+
+    def test_embedding_mode_falls_back_when_unavailable(self, monkeypatch):
+        import backend.eval.similarity as sim
+
+        def _boom(*a, **k):
+            raise sim.EmbeddingsUnavailableError("forced")
+
+        monkeypatch.setattr(sim.EmbeddingBackend, "_load_local_model", staticmethod(_boom))
+        m = ContextRelevanceMetric(similarity_mode="embedding")
+        step = Step(
+            step_id=0,
+            step_type=StepType.RETRIEVAL,
+            context_chunks=["python is a programming language"],
+        )
+        result = m.score_step(_traj(query="what is python"), step)
+        assert 0.0 <= result.score <= 1.0
+
+    def test_hybrid_mode_uses_token_fallback(self, monkeypatch):
+        import backend.eval.similarity as sim
+
+        def _boom(*a, **k):
+            raise sim.EmbeddingsUnavailableError("forced")
+
+        monkeypatch.setattr(sim.EmbeddingBackend, "_load_local_model", staticmethod(_boom))
+        m = ContextRelevanceMetric(similarity_mode="hybrid")
+        step = Step(
+            step_id=0,
+            step_type=StepType.RETRIEVAL,
+            context_chunks=["python programming language"],
+        )
+        result = m.score_step(_traj(query="python programming"), step)
+        assert result.score > 0
 
 
 # ---------------------------------------------------------------------------

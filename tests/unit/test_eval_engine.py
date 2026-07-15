@@ -158,6 +158,72 @@ class TestEvalEngine:
         assert "dummy" in scores
         assert scores["dummy"] > 0
 
+    @pytest.mark.asyncio
+    async def test_evaluate_batch_returns_ordered_results(self):
+        engine = EvalEngine(metrics=[_DummyMetric(0.9)])
+        trajs = [_make_trajectory(n_steps=3) for _ in range(3)]
+        results = await engine.evaluate_batch(trajs)
+        assert len(results) == 3
+        assert all(isinstance(r, EvalResult) for r in results)
+        assert [r.trajectory_id for r in results] == [t.trajectory_id for t in trajs]
+
+    @pytest.mark.asyncio
+    async def test_evaluate_batch_empty(self):
+        engine = EvalEngine(metrics=[_DummyMetric(0.9)])
+        results = await engine.evaluate_batch([])
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_evaluate_batch_concurrency_preserved(self):
+        engine = EvalEngine(metrics=[_DummyMetric(0.5)], parallel=False)
+        trajs = [_make_trajectory(n_steps=3) for _ in range(4)]
+        results = await engine.evaluate_batch(trajs, max_concurrency=1)
+        assert len(results) == 4
+        assert all(r.aggregate_score > 0 for r in results)
+
+    @pytest.mark.asyncio
+    async def test_pure_logic_metrics_run_inline(self, monkeypatch):
+        # cpu_bound=False metrics are run inline (no thread pool). Verify the
+        # executor is never touched for a pure-logic-only engine.
+        from backend.eval.metrics.trajectory_coherence import TrajectoryCoherenceMetric
+
+        executor_calls = []
+
+        def _fake_run_in_executor(executor, fn, *args):
+            executor_calls.append((fn, args))
+
+            class _Fut:
+                def result(self):
+                    return fn(*args)
+
+            return _Fut()
+
+        monkeypatch.setattr(
+            "asyncio.AbstractEventLoop.run_in_executor", _fake_run_in_executor
+        )
+        engine = EvalEngine(metrics=[TrajectoryCoherenceMetric()], parallel=True)
+        traj = _make_trajectory(n_steps=4)
+        result = await engine.run(traj)
+        assert len(result.metric_results) == 1
+        assert executor_calls == []  # inline, no thread spawn
+
+    def test_cpu_bound_flags(self):
+        from backend.eval.metrics.faithfulness import FaithfulnessMetric
+        from backend.eval.metrics.context_relevance import ContextRelevanceMetric
+        from backend.eval.metrics.trajectory_coherence import TrajectoryCoherenceMetric
+        from backend.eval.metrics.tool_call_accuracy import ToolCallAccuracyMetric
+        from backend.eval.metrics.guardrail_fp_rate import GuardrailFPRateMetric
+        from backend.eval.metrics.cost_efficiency import CostEfficiencyMetric
+
+        # Embedding/network-bound metrics stay cpu_bound=True.
+        assert FaithfulnessMetric().cpu_bound is True
+        assert ContextRelevanceMetric().cpu_bound is True
+        # Pure-logic metrics are marked False.
+        assert TrajectoryCoherenceMetric().cpu_bound is False
+        assert ToolCallAccuracyMetric().cpu_bound is False
+        assert GuardrailFPRateMetric().cpu_bound is False
+        assert CostEfficiencyMetric().cpu_bound is False
+
 
 # ---------------------------------------------------------------------------
 # EvalResult model tests

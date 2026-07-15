@@ -10,6 +10,8 @@ import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from backend.db.repository import PluginStateRepository
+from backend.db.session import get_session_factory
 from backend.plugins.discovery import PluginDiscovery
 from backend.plugins.loader import PluginLoader
 from backend.plugins.marketplace import PluginMarketplace
@@ -30,7 +32,36 @@ router = APIRouter(prefix="/plugins", tags=["plugins"])
 
 @lru_cache(maxsize=1)
 def _get_plugin_registry_singleton() -> PluginRegistry:
-    return PluginRegistry()
+    registry = PluginRegistry()
+    database_url = os.environ.get("DATABASE_URL")
+    if database_url:
+        try:
+            factory = get_session_factory(database_url)
+            repo = PluginStateRepository(factory())
+            # Rehydrate in-memory registry from persisted plugin states.
+            # Only when no event loop is running (e.g. at import/startup);
+            # writes still mirror to the DB regardless via the wired repo.
+            import asyncio
+
+            try:
+                loop_running = asyncio.get_event_loop().is_running()
+            except RuntimeError:
+                loop_running = False
+            if not loop_running:
+                states = asyncio.get_event_loop().run_until_complete(repo.get_enabled())
+                for state in states:
+                    try:
+                        registry._rehydrate(state)
+                    except Exception as exc:
+                        logger.warning(
+                            "plugin_rehydrate_failed",
+                            plugin_id=state.get("plugin_id"),
+                            error=str(exc),
+                        )
+            registry.set_db_repo(repo)
+        except Exception as exc:
+            logger.warning("plugin_registry_db_init_failed", error=str(exc))
+    return registry
 
 
 @lru_cache(maxsize=1)
@@ -48,7 +79,15 @@ def _get_plugin_marketplace_singleton() -> PluginMarketplace:
     registry = _get_plugin_registry_singleton()
     loader = _get_plugin_loader_singleton()
     discovery = _get_plugin_discovery_singleton()
-    return PluginMarketplace(registry, loader, discovery)
+    marketplace = PluginMarketplace(registry, loader, discovery)
+    database_url = os.environ.get("DATABASE_URL")
+    if database_url:
+        try:
+            factory = get_session_factory(database_url)
+            marketplace.set_db_repo(PluginStateRepository(factory()))
+        except Exception as exc:
+            logger.warning("plugin_marketplace_db_init_failed", error=str(exc))
+    return marketplace
 
 
 @lru_cache(maxsize=1)
@@ -334,7 +373,7 @@ async def install_plugin(
 
     try:
         with sandbox.timed_execution(body.plugin_id):
-            result = marketplace.install(body.plugin_id, version=body.version)
+            result = await marketplace.install(body.plugin_id, version=body.version)
     except PluginSecurityError as exc:
         sandbox.log_operation("install_blocked", plugin_id=body.plugin_id, reason=str(exc))
         raise HTTPException(status_code=422, detail=str(exc))
@@ -365,7 +404,7 @@ async def uninstall_plugin(
     Requires X-API-Key header when EVALOPS_ADMIN_API_KEY is configured.
     """
     sandbox.log_operation("uninstall_attempt", plugin_id=plugin_id)
-    result = marketplace.uninstall(plugin_id)
+    result = await marketplace.uninstall(plugin_id)
     if not result.success:
         sandbox.log_operation("uninstall_failed", plugin_id=plugin_id, message=result.message)
         raise HTTPException(status_code=404, detail=result.message)

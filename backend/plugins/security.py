@@ -212,6 +212,24 @@ class PluginSandbox:
     # Builtin restriction
     # ------------------------------------------------------------------
 
+    def _safe_import(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        """Restricted ``__import__`` that enforces :data:`BLOCKED_IMPORTS`.
+
+        Normal (whitelisted) imports still work inside plugin code, but blocked
+        modules such as ``os`` or ``subprocess`` raise :class:`PluginSecurityError`
+        instead of being silently importable.
+        """
+        import builtins as _builtins
+
+        root = name.split(".")[0]
+        if root in self._blocked:
+            self._log_audit("blocked_import_attempt", module=name)
+            raise PluginSecurityError(
+                f"Import of '{name}' is blocked by the plugin sandbox. "
+                f"Allowed imports include: {', '.join(sorted(self._safe))}"
+            )
+        return _builtins.__import__(name, *args, **kwargs)
+
     def restricted_builtins(self) -> dict[str, Any]:
         """Return a builtins dict with dangerous functions removed."""
         import builtins as _builtins
@@ -219,8 +237,9 @@ class PluginSandbox:
         safe = {k: getattr(_builtins, k) for k in dir(_builtins) if not k.startswith("_")}
         for name in self._blocked_builtins:
             safe.pop(name, None)
-        # Re-inject __import__ so normal imports still work inside plugin code
-        safe["__import__"] = _builtins.__import__
+        # Provide a sandbox-enforcing __import__ so that normal imports inside
+        # plugin code still work while blocked modules raise PluginSecurityError.
+        safe["__import__"] = self._safe_import
         return safe
 
     # ------------------------------------------------------------------

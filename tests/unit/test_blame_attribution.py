@@ -176,6 +176,54 @@ class TestBlameAttributionEngine:
         assert "dimensions" in report.rubric
         assert len(report.rubric["dimensions"]) == 5
 
+    def test_llm_judgement_disabled_is_empty(self, failing_trajectory, monkeypatch):
+        # Default: LLM disabled -> no network, llm_judgement == {}.
+        monkeypatch.setenv("EVALOPS_LLM_ENABLED", "false")
+        report = self.engine.analyse(failing_trajectory)
+        assert report.llm_judgement == {}
+        assert report.to_dict()["llm_judgement"] == {}
+
+    def test_llm_judgement_enabled_success(self, failing_trajectory, monkeypatch):
+        monkeypatch.setenv("EVALOPS_LLM_ENABLED", "true")
+
+        class _FakeClient:
+            enabled = True
+
+            def judge(self, rubric):
+                return {
+                    "scores": {"retrieval_quality": 0.7},
+                    "rationale": "looks fine",
+                }
+
+        monkeypatch.setattr(
+            "backend.eval.blame_attribution.LLMJudgeClient",
+            lambda: _FakeClient(),
+        )
+        report = self.engine.analyse(failing_trajectory)
+        assert report.llm_judgement["scores"] == {"retrieval_quality": 0.7}
+        assert "rationale" in report.llm_judgement
+        assert "llm_judgement" in report.to_dict()
+
+    def test_llm_judgement_graceful_on_error(self, failing_trajectory, monkeypatch):
+        monkeypatch.setenv("EVALOPS_LLM_ENABLED", "true")
+
+        import backend.eval.llm_judge as lj
+
+        class _BoomClient:
+            enabled = True
+
+            def judge(self, rubric):
+                raise lj.LLMJudgeError("boom")
+
+        monkeypatch.setattr(
+            "backend.eval.blame_attribution.LLMJudgeClient",
+            lambda: _BoomClient(),
+        )
+        # Must still return a valid report.
+        report = self.engine.analyse(failing_trajectory)
+        assert report.llm_judgement == {}
+        assert report.root_cause_step != "none"
+
     def test_score_penalises_failures(self, failing_trajectory):
         report = self.engine.analyse(failing_trajectory)
         assert 0.0 <= report.score <= 1.0

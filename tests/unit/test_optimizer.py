@@ -297,3 +297,130 @@ class TestApplyThresholds:
         new_config = _apply_thresholds(config, {"f1": 0.9})
         assert new_config.filters[0].threshold == 0.9
         assert new_config.filters[1].threshold == 0.7  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# Optuna pruning + Pareto front tests (Tasks 2.3 / 2.5)
+# ---------------------------------------------------------------------------
+
+
+class _FakeEval:
+    """Async eval fn emitting a configurable EvalOutcome."""
+
+    def __init__(self, outcome_factory):
+        self._factory = outcome_factory
+
+    async def __call__(self, config):
+        return self._factory()
+
+
+async def test_config_sweeper_prunes_with_intermediate_values(monkeypatch):
+    import optuna
+
+    from backend.optimizer import config_sweeper as cs_mod
+
+    # sklearn (param importances) may be absent in test env; stub it.
+    monkeypatch.setattr(
+        cs_mod.optuna.importance, "get_param_importances", lambda *a, **k: {}
+    )
+
+    from backend.optimizer.config_sweeper import ConfigSweeper, EvalOutcome
+
+    # Vary intermediate values across trials: early trials look promising,
+    # later ones clearly worse, so the MedianPruner cuts them.
+    counter = {"n": 0}
+
+    def factory():
+        counter["n"] += 1
+        n = counter["n"]
+        # First two trials: high intermediate signal (survive).
+        # Rest: monotonic decline -> pruned against the running median.
+        if n <= 2:
+            vals = [0.9 - 0.05 * n, 0.8, 0.7]
+        else:
+            vals = [0.1, 0.05, 0.02]
+        return EvalOutcome(
+            quality_score=0.5,
+            cost_usd=0.01,
+            latency_ms=100,
+            metadata={"intermediate_values": vals},
+        )
+
+    sweeper = ConfigSweeper(
+        _FakeEval(factory),
+        n_trials=8,
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=0, n_warmup_steps=0),
+    )
+    result = await sweeper.run()
+    assert result.trials_pruned > 0
+    assert result.trials_completed + result.trials_pruned == 8
+
+
+async def test_config_sweeper_no_prune_without_intermediate(monkeypatch):
+    # Block pruning by disabling the pruner so no intermediate_values -> 0 pruned.
+    import optuna
+
+    from backend.optimizer import config_sweeper as cs_mod
+
+    monkeypatch.setattr(
+        cs_mod.optuna.importance, "get_param_importances", lambda *a, **k: {}
+    )
+    monkeypatch.setattr(
+        optuna.pruners, "MedianPruner", lambda *a, **k: optuna.pruners.NopPruner()
+    )
+
+    from backend.optimizer.config_sweeper import ConfigSweeper, EvalOutcome
+
+    def factory():
+        return EvalOutcome(quality_score=0.6, cost_usd=0.01, latency_ms=100)
+
+    sweeper = ConfigSweeper(_FakeEval(factory), n_trials=4)
+    result = await sweeper.run()
+    assert result.trials_pruned == 0
+    assert result.trials_completed == 4
+
+
+async def test_pareto_optimizer_no_redundant_filter():
+    import optuna
+
+    from backend.optimizer.pareto_optimizer import ParetoOptimizer, EvalOutcome
+
+    def factory():
+        # Fixed point on the frontier.
+        return EvalOutcome(quality_score=0.8, cost_usd=0.02, latency_ms=120)
+
+    optimizer = ParetoOptimizer(_FakeEval(factory), n_trials=6)
+    result = await optimizer.run()
+    # study.best_trials (non-dominated set) is used directly; no O(n^2) filter.
+    assert result.total_trials == 6
+    assert len(result.pareto_front) == result.total_trials
+    # Each pareto point carries its trial number.
+    assert {p.trial_number for p in result.pareto_front} == set(range(6))
+
+
+async def test_pareto_optimizer_prune_signal_dormant_in_multiobjective():
+    # Optuna does not support Trial.report in multi-objective studies, so the
+    # pruning signal is gracefully ignored (pruning stays dormant) rather than
+    # crashing. The optimizer must still complete all trials.
+    import optuna
+
+    from backend.optimizer.pareto_optimizer import ParetoOptimizer, EvalOutcome
+
+    def factory():
+        return EvalOutcome(
+            quality_score=0.5,
+            cost_usd=0.5,
+            latency_ms=5000,
+            metadata={"intermediate_values": [0.1, 0.05, 0.02]},
+        )
+
+    optimizer = ParetoOptimizer(
+        _FakeEval(factory),
+        n_trials=8,
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=0, n_warmup_steps=0),
+    )
+    result = await optimizer.run()
+    # Pruning is dormant for NSGA-II multi-objective; all trials complete.
+    assert result.trials_pruned == 0
+    assert result.total_trials == 8
+

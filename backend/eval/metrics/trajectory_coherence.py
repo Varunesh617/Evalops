@@ -35,6 +35,7 @@ class TrajectoryCoherenceMetric(BaseMetric):
     """
 
     name = "trajectory_coherence"
+    cpu_bound = False
     description = (
         "Measures logical flow and consistency of the reasoning trajectory. "
         "1.0 = perfectly ordered and complete, 0.0 = incoherent or malformed."

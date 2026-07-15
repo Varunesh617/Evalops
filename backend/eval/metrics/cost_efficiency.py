@@ -17,6 +17,7 @@ _DEFAULT_COST_PER_1K_TOKENS: dict[str, float] = {
 
 
 class CostEfficiencyMetric(BaseMetric):
+    cpu_bound = False
     """Measure how efficiently the agent spends its budget.
 
     The metric evaluates the ratio of *useful work* to *cost incurred*:

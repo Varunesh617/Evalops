@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from backend.plugins.discovery import PluginDiscovery
 from backend.plugins.loader import PluginLoader
 from backend.plugins.registry import PluginRating, PluginRegistry
+
+if TYPE_CHECKING:
+    from backend.db.repository import PluginStateRepository
 
 logger = structlog.get_logger(__name__)
 
@@ -57,6 +60,12 @@ class PluginMarketplace:
         self._loader = loader
         self._discovery = discovery or PluginDiscovery()
         self._install_log: list[dict[str, Any]] = []
+        self._installed: dict[str, Any] = {}
+        self._db_repo: PluginStateRepository | None = None
+
+    def set_db_repo(self, repo: PluginStateRepository | None) -> None:
+        """Optionally wire a DB repository so install/uninstall state persists."""
+        self._db_repo = repo
 
     # ------------------------------------------------------------------
     # Browse
@@ -113,7 +122,7 @@ class PluginMarketplace:
     # Install / uninstall
     # ------------------------------------------------------------------
 
-    def install(self, plugin_id: str, *, version: str | None = None) -> InstallResult:
+    async def install(self, plugin_id: str, *, version: str | None = None) -> InstallResult:
         """Install a plugin by package name."""
         existing = self._registry.get(plugin_id)
         if existing is not None:
@@ -142,9 +151,10 @@ class PluginMarketplace:
 
         installed_version = ""
         for plugin in plugins.values():
-            record = self._registry.register(plugin, source=f"pip:{plugin_id}")
+            record = await self._registry.register(plugin, source=f"pip:{plugin_id}")
             plugin.on_install()
-            self._registry.record_download(plugin_id)
+            await self._registry.record_download(record.plugin_id)
+            self._installed[record.plugin_id] = plugin
             installed_version = record.version
 
         self._install_log.append({
@@ -155,6 +165,22 @@ class PluginMarketplace:
         })
         logger.info("marketplace_install", plugin_id=plugin_id, version=installed_version)
 
+        if self._db_repo is not None:
+            try:
+                await self._db_repo.upsert(
+                    plugin_id,
+                    name=record.name,
+                    version=record.version,
+                    author=record.author,
+                    description=record.description,
+                    plugin_type=record.plugin_type,
+                    enabled=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "plugin_state_persist_failed", plugin_id=plugin_id, error=str(exc)
+                )
+
         return InstallResult(
             success=True,
             plugin_id=plugin_id,
@@ -162,9 +188,22 @@ class PluginMarketplace:
             version=installed_version,
         )
 
-    def uninstall(self, plugin_id: str) -> InstallResult:
+    async def uninstall(self, plugin_id: str) -> InstallResult:
         """Uninstall a plugin."""
-        record = self._registry.unregister(plugin_id)
+        plugin = self._installed.get(plugin_id)
+        if plugin is not None:
+            try:
+                plugin.on_uninstall()
+            except Exception as exc:
+                logger.warning(
+                    "plugin_lifecycle_hook_failed",
+                    plugin_id=plugin_id,
+                    hook="on_uninstall",
+                    error=str(exc),
+                )
+            self._installed.pop(plugin_id, None)
+
+        record = await self._registry.unregister(plugin_id)
         if record is None:
             return InstallResult(
                 success=False,
@@ -178,6 +217,14 @@ class PluginMarketplace:
             "timestamp": time.time(),
         })
         logger.info("marketplace_uninstall", plugin_id=plugin_id)
+
+        if self._db_repo is not None:
+            try:
+                await self._db_repo.delete(plugin_id)
+            except Exception as exc:
+                logger.warning(
+                    "plugin_state_delete_failed", plugin_id=plugin_id, error=str(exc)
+                )
 
         return InstallResult(
             success=True,

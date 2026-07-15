@@ -6,11 +6,14 @@ import hashlib
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from backend.plugins.sdk import PluginBase
+
+if TYPE_CHECKING:
+    from backend.db.repository import PluginStateRepository
 
 logger = structlog.get_logger(__name__)
 
@@ -57,12 +60,21 @@ class PluginRegistry:
         self._plugins: dict[str, PluginRecord] = {}
         self._ratings: dict[str, PluginRating] = {}
         self._usage_log: deque[dict[str, Any]] = deque(maxlen=1000)
+        self._db_repo: PluginStateRepository | None = None
+
+    def set_db_repo(self, repo: PluginStateRepository | None) -> None:
+        """Optionally wire a DB repository so state is mirrored to the database.
+
+        When ``None`` (or ``DATABASE_URL`` is unset) the registry stays purely
+        in-memory.  All DB writes are best-effort and never raise past the caller.
+        """
+        self._db_repo = repo
 
     # ------------------------------------------------------------------
     # Register / unregister
     # ------------------------------------------------------------------
 
-    def register(self, plugin: PluginBase, *, source: str = "unknown") -> PluginRecord:
+    async def register(self, plugin: PluginBase, *, source: str = "unknown") -> PluginRecord:
         """Register a PluginBase instance and return its record."""
         plugin_type = type(plugin).__name__
         record = PluginRecord(
@@ -85,13 +97,63 @@ class PluginRegistry:
             )
         self._plugins[plugin.plugin_id] = record
         logger.info("plugin_registered", plugin_id=plugin.plugin_id, version=record.version)
+
+        if self._db_repo is not None:
+            try:
+                await self._db_repo.upsert(
+                    record.plugin_id,
+                    name=record.name,
+                    version=record.version,
+                    author=record.author,
+                    description=record.description,
+                    plugin_type=record.plugin_type,
+                    entry_point=record.entry_point,
+                    config_schema=record.config_schema,
+                    dependencies=record.dependencies,
+                    downloads=record.downloads,
+                    usage_count=record.usage_count,
+                    last_used=record.last_used,
+                    enabled=record.enabled,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "plugin_state_persist_failed", plugin_id=record.plugin_id, error=str(exc)
+                )
         return record
 
-    def unregister(self, plugin_id: str) -> PluginRecord | None:
+    async def unregister(self, plugin_id: str) -> PluginRecord | None:
         """Remove a plugin from the registry. Returns the removed record or None."""
         record = self._plugins.pop(plugin_id, None)
         if record:
             logger.info("plugin_unregistered", plugin_id=plugin_id)
+            if self._db_repo is not None:
+                try:
+                    await self._db_repo.delete(plugin_id)
+                except Exception as exc:
+                    logger.warning(
+                        "plugin_state_delete_failed", plugin_id=plugin_id, error=str(exc)
+                    )
+        return record
+
+    def _rehydrate(self, record_dict: dict[str, Any]) -> PluginRecord:
+        """Rebuild a PluginRecord from a DB dict without touching the DB again."""
+        record = PluginRecord(
+            plugin_id=record_dict["plugin_id"],
+            name=record_dict.get("name", ""),
+            version=record_dict.get("version", "0.0.0"),
+            author=record_dict.get("author", ""),
+            description=record_dict.get("description", ""),
+            plugin_type=record_dict.get("plugin_type", "plugin"),
+            entry_point=record_dict.get("entry_point", ""),
+            config_schema=record_dict.get("config_schema", {}),
+            dependencies=record_dict.get("dependencies", []),
+            installed_at=record_dict.get("installed_at", 0.0),
+            enabled=record_dict.get("enabled", True),
+            downloads=record_dict.get("downloads", 0),
+            usage_count=record_dict.get("usage_count", 0),
+            last_used=record_dict.get("last_used", 0.0),
+        )
+        self._plugins[record.plugin_id] = record
         return record
 
     # ------------------------------------------------------------------
@@ -110,12 +172,45 @@ class PluginRegistry:
     def list_enabled(self) -> list[PluginRecord]:
         return [r for r in self._plugins.values() if r.enabled]
 
-    def set_enabled(self, plugin_id: str, enabled: bool) -> bool:
+    async def set_enabled(
+        self,
+        plugin_id: str,
+        enabled: bool,
+        *,
+        plugin: PluginBase | None = None,
+    ) -> bool:
+        """Enable or disable a plugin. Fires the plugin's lifecycle hook.
+
+        The optional ``plugin`` instance is used to call ``on_enable`` /
+        ``on_disable``.  Hook failures are logged and never break the toggle.
+        """
         record = self._plugins.get(plugin_id)
         if record is None:
             return False
         record.enabled = enabled
         logger.info("plugin_toggled", plugin_id=plugin_id, enabled=enabled)
+
+        if plugin is not None:
+            try:
+                if enabled:
+                    plugin.on_enable()
+                else:
+                    plugin.on_disable()
+            except Exception as exc:
+                logger.warning(
+                    "plugin_lifecycle_hook_failed",
+                    plugin_id=plugin_id,
+                    enabled=enabled,
+                    error=str(exc),
+                )
+
+        if self._db_repo is not None:
+            try:
+                await self._db_repo.upsert(plugin_id, enabled=enabled)
+            except Exception as exc:
+                logger.warning(
+                    "plugin_state_persist_failed", plugin_id=plugin_id, error=str(exc)
+                )
         return True
 
     # ------------------------------------------------------------------
@@ -154,7 +249,7 @@ class PluginRegistry:
     # Usage tracking
     # ------------------------------------------------------------------
 
-    def record_usage(self, plugin_id: str) -> None:
+    async def record_usage(self, plugin_id: str) -> None:
         record = self._plugins.get(plugin_id)
         if record is None:
             return
@@ -164,11 +259,29 @@ class PluginRegistry:
             "plugin_id": plugin_id,
             "timestamp": time.time(),
         })
+        if self._db_repo is not None:
+            try:
+                await self._db_repo.upsert(
+                    plugin_id,
+                    usage_count=record.usage_count,
+                    last_used=record.last_used,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "plugin_state_persist_failed", plugin_id=plugin_id, error=str(exc)
+                )
 
-    def record_download(self, plugin_id: str) -> None:
+    async def record_download(self, plugin_id: str) -> None:
         record = self._plugins.get(plugin_id)
         if record:
             record.downloads += 1
+            if self._db_repo is not None:
+                try:
+                    await self._db_repo.upsert(plugin_id, downloads=record.downloads)
+                except Exception as exc:
+                    logger.warning(
+                        "plugin_state_persist_failed", plugin_id=plugin_id, error=str(exc)
+                    )
 
     def get_usage_stats(self, plugin_id: str) -> dict[str, Any]:
         record = self._plugins.get(plugin_id)

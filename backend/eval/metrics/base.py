@@ -26,9 +26,18 @@ class BaseMetric(abc.ABC):
 
     name: str = "base"
     description: str = ""
+    # Metrics that are pure-Python logic (no IO, no embeddings, no network) can
+    # run inline on the event loop instead of being offloaded to a thread pool.
+    # Embedding/network-bound metrics keep this True.
+    cpu_bound: bool = True
 
-    def __init__(self, **config: Any) -> None:
+    def __init__(self, *, irrelevant_weight: float = 0.25, **config: Any) -> None:
+        if not 0.0 <= irrelevant_weight <= 1.0:
+            raise ValueError(
+                f"irrelevant_weight must be in [0.0, 1.0], got {irrelevant_weight}"
+            )
         self.config = config
+        self.irrelevant_weight = irrelevant_weight
         self._log = logger.bind(metric=self.name)
 
     # ------------------------------------------------------------------
@@ -74,16 +83,25 @@ class BaseMetric(abc.ABC):
         self,
         trajectory: Trajectory,
         step_scores: list[StepScore],
+        *,
+        irrelevant_weight: float | None = None,
     ) -> float:
         """Combine per-step scores into a single overall score.
 
         Default: weighted mean where steps matching ``_relevant_step_types``
-        carry weight 1 and others carry weight 0.25.
+        carry weight 1 and others carry weight ``irrelevant_weight`` (defaulting
+        to :attr:`self.irrelevant_weight`, normally 0.25). Pass
+        ``irrelevant_weight`` to override the configured value for a single call.
         """
+        weight = (
+            self.irrelevant_weight
+            if irrelevant_weight is None
+            else irrelevant_weight
+        )
         if not step_scores:
             return 0.0
         weights = [
-            1.0 if self._is_relevant(s) else 0.25 for s in step_scores
+            1.0 if self._is_relevant(s) else weight for s in step_scores
         ]
         total = sum(s.score * w for s, w in zip(step_scores, weights))
         total_weight = sum(weights)

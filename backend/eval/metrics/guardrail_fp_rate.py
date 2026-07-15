@@ -11,6 +11,7 @@ logger = structlog.get_logger(__name__)
 
 
 class GuardrailFPRateMetric(BaseMetric):
+    cpu_bound = False
     """Measure the false-positive rate of guardrail blocks.
 
     The trajectory carries two flags:

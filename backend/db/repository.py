@@ -18,11 +18,14 @@ from backend.db.models import (
     Pipeline,
     PipelineRun,
     Plugin,
+    PluginState,
     Sweep,
     SweepTrial,
     Trace,
     TraceStep,
+    TuningPreset,
     UserConfig,
+    UserPreferenceState,
 )
 
 if TYPE_CHECKING:
@@ -469,3 +472,97 @@ class UserConfigRepository(BaseRepository[UserConfig]):
         )
         result = await self._session.execute(stmt)
         return [_obj_to_dict(o) for o in result.scalars().all()]
+
+
+# ---------------------------------------------------------------------------
+# PluginState
+# ---------------------------------------------------------------------------
+
+
+class PluginStateRepository(BaseRepository[PluginState]):
+    """Persisted mirror of the in-memory PluginRegistry."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        super().__init__(session, PluginState)
+
+    async def upsert(self, plugin_id: str, **fields: Any) -> dict[str, Any] | None:
+        """Insert or update a plugin state row, returning the resulting dict."""
+        existing = await self._session.get(PluginState, plugin_id)
+        if existing is None:
+            record = {"plugin_id": plugin_id, **fields}
+            return await self.create(record)
+        return await self.update(plugin_id, fields)
+
+    async def get_enabled(self) -> Sequence[dict[str, Any]]:
+        """Return all rows that are currently enabled."""
+        stmt = select(PluginState).where(PluginState.enabled.is_(True))
+        result = await self._session.execute(stmt)
+        return [_obj_to_dict(o) for o in result.scalars().all()]
+
+
+# ---------------------------------------------------------------------------
+# TuningPreset
+# ---------------------------------------------------------------------------
+
+
+class TuningPresetRepository(BaseRepository[TuningPreset]):
+    """Persisted custom tuning presets."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        super().__init__(session, TuningPreset)
+
+    async def list_for_user(
+        self, user_id: str, *, offset: int = 0, limit: int = 50
+    ) -> Sequence[dict[str, Any]]:
+        stmt = (
+            select(TuningPreset)
+            .where(TuningPreset.user_id == user_id)
+            .order_by(TuningPreset.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        result = await self._session.execute(stmt)
+        return [_obj_to_dict(o) for o in result.scalars().all()]
+
+    async def delete_custom(self, preset_id: str) -> bool:
+        """Delete a preset, refusing to remove built-in rows.
+
+        Returns ``False`` if the row does not exist or is a built-in preset.
+        """
+        instance = await self._session.get(TuningPreset, preset_id)
+        if instance is None or instance.is_builtin:
+            return False
+        await self._session.delete(instance)
+        await self._session.flush()
+        return True
+
+
+# ---------------------------------------------------------------------------
+# UserPreferenceState
+# ---------------------------------------------------------------------------
+
+
+class UserPreferenceRepository(BaseRepository[UserPreferenceState]):
+    """Persisted user tuning preferences keyed by user_id."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        super().__init__(session, UserPreferenceState)
+
+    async def get_for_user(self, user_id: str) -> dict[str, Any] | None:
+        """Return the preference state row for a user, or ``None``."""
+        stmt = select(UserPreferenceState).where(UserPreferenceState.user_id == user_id)
+        result = await self._session.execute(stmt)
+        obj = result.scalar_one_or_none()
+        return _obj_to_dict(obj) if obj is not None else None
+
+    async def upsert(self, user_id: str, *, preferences_json: dict[str, Any]) -> dict[str, Any]:
+        """Insert or update the preference state for a user."""
+        existing = await self._session.get(UserPreferenceState, user_id)
+        if existing is None:
+            record = {
+                "id": user_id,
+                "user_id": user_id,
+                "preferences_json": preferences_json,
+            }
+            return await self.create(record)
+        return await self.update(user_id, {"preferences_json": preferences_json})

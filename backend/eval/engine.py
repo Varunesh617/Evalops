@@ -62,9 +62,43 @@ class EvalEngine:
     ) -> MetricResult:
         """Run a single named metric against *trajectory*."""
         metric = self._find_metric(metric_name)
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, metric.evaluate, trajectory)
-        return result
+        return await self._run_metric(metric, trajectory)
+
+    async def evaluate_batch(
+        self,
+        trajectories: Sequence[Trajectory],
+        *,
+        max_concurrency: int = 8,
+    ) -> list[EvalResult]:
+        """Evaluate many trajectories with bounded concurrency.
+
+        Reuses :meth:`run` per trajectory. Results are aligned 1:1 with the
+        input order. Every metric is offloaded to the default executor
+        internally by :meth:`run`, so the event loop stays responsive.
+        """
+        if not trajectories:
+            return []
+        sem = asyncio.Semaphore(max(1, max_concurrency))
+        logger.info(
+            "eval_batch.started",
+            count=len(trajectories),
+            max_concurrency=max_concurrency,
+        )
+        t0 = time.perf_counter()
+
+        async def _run_one(traj: Trajectory) -> EvalResult:
+            async with sem:
+                return await self.run(traj)
+
+        results = list(await asyncio.gather(*(_run_one(t) for t in trajectories)))
+
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "eval_batch.completed",
+            count=len(results),
+            elapsed_ms=round(elapsed * 1000, 1),
+        )
+        return results
 
     # ------------------------------------------------------------------
     # Internals
@@ -93,20 +127,31 @@ class EvalEngine:
             f"Available: {[m.name for m in self._metrics]}"
         )
 
-    async def _run_parallel(self, trajectory: Trajectory) -> list[MetricResult]:
+    async def _run_metric(
+        self,
+        metric: BaseMetric,
+        trajectory: Trajectory,
+    ) -> MetricResult:
+        """Run a single metric offloaded to the default thread pool executor.
+
+        All metrics run via :meth:`loop.run_in_executor` so the FastAPI event
+        loop is never blocked by synchronous ``metric.evaluate`` work, regardless
+        of whether the metric is pure-Python logic or I/O bound. The
+        ``cpu_bound`` attribute on :class:`BaseMetric` is retained for
+        introspection but is no longer used to decide offloading.
+        """
         loop = asyncio.get_running_loop()
-        tasks = [
-            loop.run_in_executor(None, m.evaluate, trajectory)
-            for m in self._metrics
-        ]
-        return list(await asyncio.gather(*tasks))
+        return await loop.run_in_executor(None, metric.evaluate, trajectory)
+
+    async def _run_parallel(self, trajectory: Trajectory) -> list[MetricResult]:
+        return list(
+            await asyncio.gather(*(self._run_metric(m, trajectory) for m in self._metrics))
+        )
 
     async def _run_sequential(self, trajectory: Trajectory) -> list[MetricResult]:
         results: list[MetricResult] = []
         for m in self._metrics:
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(None, m.evaluate, trajectory)
-            results.append(result)
+            results.append(await self._run_metric(m, trajectory))
         return results
 
     # ------------------------------------------------------------------
