@@ -665,6 +665,84 @@ export const diagnosis = {
   },
 };
 
+// Settings — LLM provider configuration
+export type ProviderKind = "openai" | "ollama" | "anthropic" | "openrouter" | "custom";
+
+export interface ProviderInfo {
+  name: string;
+  kind: ProviderKind;
+  base_url: string;
+  default_model: string;
+  is_default: boolean;
+  api_key_state?: "set" | "unset";
+}
+
+export interface ProviderListResponse {
+  providers: ProviderInfo[];
+  active_provider: string;
+  llm_enabled: boolean;
+}
+
+export interface ProviderUpsert {
+  name: string;
+  kind: ProviderKind;
+  base_url: string;
+  api_key?: string;
+  default_model: string;
+  is_default?: boolean;
+}
+
+export interface SetActive {
+  name: string;
+  llm_enabled?: boolean;
+}
+
+export interface TestConn {
+  name?: string;
+  base_url?: string;
+  api_key?: string;
+  model?: string;
+  kind?: ProviderKind;
+}
+
+export interface TestConnResponse {
+  ok: boolean;
+  error?: string;
+  model?: string;
+}
+
+function adminHeaders(): Record<string, string> {
+  const key = process.env.NEXT_PUBLIC_ADMIN_API_KEY;
+  return key ? { "X-API-Key": key } : {};
+}
+
+export const settings = {
+  listProviders: () => request<ProviderListResponse>("/settings/providers"),
+  addProvider: (req: ProviderUpsert) =>
+    request<ProviderInfo>("/settings/providers", {
+      method: "POST",
+      headers: adminHeaders(),
+      body: JSON.stringify(req),
+    }),
+  deleteProvider: (name: string) =>
+    request<void>(`/settings/providers/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+      headers: adminHeaders(),
+    }),
+  setActive: (req: SetActive) =>
+    request<void>("/settings/providers/active", {
+      method: "PUT",
+      headers: adminHeaders(),
+      body: JSON.stringify(req),
+    }),
+  testConnection: (req: TestConn) =>
+    request<TestConnResponse>("/settings/providers/test", {
+      method: "POST",
+      headers: adminHeaders(),
+      body: JSON.stringify(req),
+    }),
+};
+
 // Cost analysis
 export const costs = {
   report: (opts: {

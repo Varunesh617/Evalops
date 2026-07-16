@@ -13,6 +13,7 @@ const NAV_ITEMS = [
   { href: "/cost-analysis", label: "Cost Analysis", icon: "💰" },
   { href: "/tuning", label: "Tuning", icon: "🎛" },
   { href: "/plugins", label: "Plugins", icon: "🧩" },
+  { href: "/settings", label: "Settings", icon: "⚙️" },
 ];
 
 export default function Sidebar({ onNavigate }: { onNavigate?: () => void } = {}) {

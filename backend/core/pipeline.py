@@ -14,6 +14,7 @@ from typing import Any, Protocol, runtime_checkable
 import structlog
 
 from backend.core.config import PipelineConfig, StepStatus
+from backend.core.llm_client import LLMClient, LLMClientError
 from backend.core.tracer import TokenUsage, Tracer, Trajectory
 
 logger = structlog.get_logger(__name__)
@@ -127,14 +128,59 @@ class RerankStep(_BaseStep):
 
 
 class ReasonStep(_BaseStep):
-    """Skeleton reasoning / agent step."""
+    """Reasoning / agent step.
+
+    Calls the configured LLM (via :class:`LLMClient`) to reason over the
+    reranked documents. Falls back to an empty reasoning string when no LLM
+    key/endpoint is configured, preserving skeleton behaviour for tests and
+    offline runs.
+    """
 
     def __init__(self) -> None:
         super().__init__("reason")
 
     async def execute(self, context: PipelineContext) -> dict[str, Any]:
+        cfg = context.config.agent
         logger.info("reason_started", doc_count=len(context.reranked))
-        return {"status": "success", "reasoning": ""}
+
+        client = LLMClient(
+            model=cfg.model,
+            api_key=cfg.api_key.get_secret_value() if cfg.api_key else None,
+            base_url=cfg.base_url,
+            provider=cfg.provider or "auto",
+            timeout=cfg.timeout_seconds,
+        )
+        if not client.configured:
+            return {"status": "success", "reasoning": "", "llm_used": False}
+
+        docs = context.reranked or context.documents
+        context_block = "\n\n".join(
+            f"[{i + 1}] {d.get('content', d.get('text', ''))}"
+            for i, d in enumerate(docs)
+        )
+        user_msg = (
+            f"Query: {context.query}\n\n"
+            f"Retrieved context:\n{context_block}\n\n"
+            "Reason step-by-step about how to answer the query using the "
+            "provided context. Output your reasoning only."
+        )
+        try:
+            result = await client.complete(
+                [{"role": "user", "content": user_msg}],
+                temperature=cfg.temperature,
+                max_tokens=cfg.max_tokens,
+                system=cfg.system_prompt,
+            )
+        except LLMClientError as exc:
+            logger.warning("reason_llm_failed", error=str(exc))
+            return {"status": "success", "reasoning": "", "llm_used": False}
+
+        return {
+            "status": "success",
+            "reasoning": result["text"],
+            "tokens": result["tokens"],
+            "llm_used": True,
+        }
 
 
 class GuardrailStep(_BaseStep):
@@ -152,14 +198,63 @@ class GuardrailStep(_BaseStep):
 
 
 class GenerateStep(_BaseStep):
-    """Skeleton generation step."""
+    """Final generation step.
+
+    Calls the configured LLM (via :class:`LLMClient`) to produce the answer
+    from the reranked documents (and optional reasoning). Falls back to an
+    empty string when no LLM key/endpoint is configured.
+    """
 
     def __init__(self) -> None:
         super().__init__("generate")
 
     async def execute(self, context: PipelineContext) -> dict[str, Any]:
+        cfg = context.config.generator
         logger.info("generate_started")
-        return {"status": "success", "text": ""}
+
+        client = LLMClient(
+            model=cfg.model,
+            api_key=cfg.api_key.get_secret_value() if cfg.api_key else None,
+            base_url=cfg.base_url,
+            provider=cfg.provider or "auto",
+            timeout=cfg.timeout_seconds,
+        )
+        if not client.configured:
+            return {"status": "success", "text": "", "llm_used": False}
+
+        docs = context.reranked or context.documents
+        context_block = "\n\n".join(
+            f"[{i + 1}] {d.get('content', d.get('text', ''))}"
+            for i, d in enumerate(docs)
+        )
+        user_parts = [f"Query: {context.query}", f"Context:\n{context_block}"]
+        if context.reasoning:
+            user_parts.append(f"Reasoning:\n{context.reasoning}")
+        user_parts.append("Answer the query using only the provided context.")
+        user_msg = "\n\n".join(user_parts)
+
+        try:
+            result = await client.complete(
+                [{"role": "user", "content": user_msg}],
+                temperature=cfg.temperature,
+                max_tokens=cfg.max_tokens,
+                system=cfg.system_prompt,
+            )
+        except LLMClientError as exc:
+            logger.warning("generate_llm_failed", error=str(exc))
+            return {"status": "success", "text": "", "llm_used": False}
+
+        answer = result["text"]
+        if cfg.include_citations and docs:
+            answer = f"{answer}\n\nSources:\n" + "\n".join(
+                f"[{i + 1}]" for i in range(len(docs))
+            )
+        return {
+            "status": "success",
+            "text": answer,
+            "tokens": result["tokens"],
+            "llm_used": True,
+        }
 
 
 # ---------------------------------------------------------------------------

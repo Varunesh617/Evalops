@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "evalops"
 version = "0.1.0"
 description = "Unified Full-Pipeline Evaluation & Optimization Platform"
-readme = "README.md"
+readme = "EXECUTION_PLAN.md"
 requires-python = ">=3.13"
 license = "MIT"
 authors = [{ name = "EvalOps Team" }]
@@ -25,6 +25,7 @@ dependencies = [
     "opentelemetry-sdk>=1.25.0",
     "opentelemetry-exporter-otlp>=1.25.0",
     "httpx>=0.27.0",
+    "typer>=0.12.0",
     "structlog>=24.0.0",
     "optuna>=4.0.0",
     "numpy>=1.26.0",
@@ -33,6 +34,9 @@ dependencies = [
     "pyyaml>=6.0.0",
     "packaging>=24.0.0",
 ]
+
+[project.scripts]
+evalops = "backend.cli:app"
 
 [project.entry-points."evalops.plugins"]
 # Third-party plugins register here, e.g.:
@@ -62,6 +66,9 @@ test = [
     "pytest-cov>=5.0.0",
     "httpx>=0.27.0",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend"]
 
 [tool.ruff]
 target-version = "py313"
