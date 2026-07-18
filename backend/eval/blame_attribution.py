@@ -38,6 +38,7 @@ class FailureMode(enum.StrEnum):
     TOKEN_LIMIT = "token_limit"
     EXCEPTION = "exception"
     DEGRADATION = "degradation"
+    SLOW_STEP = "slow_step"
     UNKNOWN = "unknown"
 
 
@@ -76,6 +77,7 @@ class BlameReport:
     rubric: dict[str, Any] = field(default_factory=dict)
     llm_judgement: dict[str, Any] = field(default_factory=dict)
     score: float = 0.0  # 0.0 = severe failure, 1.0 = fully healthy
+    step_timings: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -99,6 +101,7 @@ class BlameReport:
             "rubric": self.rubric,
             "llm_judgement": self.llm_judgement,
             "score": self.score,
+            "step_timings": self.step_timings,
         }
 
 
@@ -145,6 +148,33 @@ def _rule_token_limit(step: TrajectoryStep, _traj: Trajectory) -> bool:
     return "token" in err or "context_length" in err
 
 
+# Per-step latency budgets (ms).  Used by the slow-step heuristic when the
+# trajectory's own config does not supply a timeout for the step.
+DEFAULT_STEP_LATENCY_BUDGET_MS: dict[str, float] = {
+    "retrieve": 5000.0,
+    "rerank": 5000.0,
+    "reason": 60000.0,
+    "guardrail": 30000.0,
+    "generate": 60000.0,
+}
+
+
+def budget_for(step: TrajectoryStep, trajectory: Trajectory) -> float:
+    """Latency budget (ms) for *step*, from config timeout if available."""
+    config = getattr(trajectory, "config", None)
+    if config is not None:
+        step_cfg = getattr(config, step.step_name, None)
+        if step_cfg is not None and getattr(step_cfg, "timeout_seconds", None) is not None:
+            return float(step_cfg.timeout_seconds) * 1000.0
+    return DEFAULT_STEP_LATENCY_BUDGET_MS.get(step.step_name, 60000.0)
+
+
+def _rule_slow(step: TrajectoryStep, trajectory: Trajectory) -> bool:
+    if step.latency_ms is None:
+        return False
+    return step.latency_ms > budget_for(step, trajectory)
+
+
 @dataclass(frozen=True, slots=True)
 class _Rule:
     predicate: Any  # (TrajectoryStep, Trajectory) -> bool
@@ -159,6 +189,7 @@ _HEURISTIC_RULES: list[_Rule] = [
     _Rule(_rule_low_score, FailureMode.LOW_SCORE, Severity.MEDIUM, "Step quality score {score:.2f} below threshold"),
     _Rule(_rule_empty_result, FailureMode.EMPTY_RESULT, Severity.MEDIUM, "Step produced empty output"),
     _Rule(_rule_token_limit, FailureMode.TOKEN_LIMIT, Severity.HIGH, "Token limit exceeded: {error}"),
+    _Rule(_rule_slow, FailureMode.SLOW_STEP, Severity.MEDIUM, "Step exceeded latency budget: {latency_ms:.0f}ms > {budget:.0f}ms"),
     _Rule(_rule_exception, FailureMode.EXCEPTION, Severity.HIGH, "{error}"),
 ]
 
@@ -200,6 +231,7 @@ class BlameAttributionEngine:
         root_index: int,
         steps: list[TrajectoryStep],
         root_rule: _Rule,
+        trajectory: Trajectory,
     ) -> list[CascadeLink]:
         """Build a cascade chain from *root_index* forward.
 
@@ -239,6 +271,8 @@ class BlameAttributionEngine:
                     message=root_rule.message_template.format(
                         error=step.error or "",
                         score=step.metrics.score or 0.0,
+                        latency_ms=step.latency_ms or 0.0,
+                        budget=budget_for(step, trajectory) or 0.0,
                     ),
                     propagated=propagated,
                 )
@@ -363,6 +397,8 @@ class BlameAttributionEngine:
             case FailureMode.EXCEPTION:
                 suggestions.append("Inspect the stack trace and add error handling.")
                 suggestions.append("Add retry logic for transient errors.")
+            case FailureMode.SLOW_STEP:
+                suggestions.append("Increase timeout_seconds or optimize the step; consider a smaller model / fewer tokens.")
             case FailureMode.DEGRADATION:
                 suggestions.append("Investigate why this step degraded despite upstream recovery.")
             case _:
@@ -383,9 +419,39 @@ class BlameAttributionEngine:
         """
         steps = trajectory.steps
 
-        # If no failures, return a healthy report.
+        # If no failures, check for slow steps (still SUCCESS but over budget).
         failed = [i for i, s in enumerate(steps) if s.status != StepStatus.SUCCESS]
         if not failed:
+            slow_index = next(
+                (i for i, s in enumerate(steps) if _rule_slow(s, trajectory)),
+                None,
+            )
+            step_timings = [
+                {
+                    "step": step.step_name,
+                    "latency_ms": step.latency_ms,
+                    "total_tokens": step.tokens.total_tokens,
+                }
+                for step in steps
+            ]
+            if slow_index is not None:
+                slow_step = steps[slow_index]
+                budget = budget_for(slow_step, trajectory)
+                return BlameReport(
+                    run_id=trajectory.run_id,
+                    root_cause_step=slow_step.step_name,
+                    root_cause_mode=FailureMode.SLOW_STEP,
+                    root_cause_message=(
+                        f"Step exceeded latency budget: "
+                        f"{slow_step.latency_ms:.0f}ms > {budget:.0f}ms"
+                    ),
+                    severity=Severity.MEDIUM,
+                    remediation=self._suggest_remediation(
+                        slow_step, FailureMode.SLOW_STEP
+                    ),
+                    step_timings=step_timings,
+                    score=0.85,
+                )
             return BlameReport(
                 run_id=trajectory.run_id,
                 root_cause_step="none",
@@ -393,6 +459,7 @@ class BlameAttributionEngine:
                 root_cause_message="All steps completed successfully.",
                 severity=Severity.LOW,
                 score=1.0,
+                step_timings=step_timings,
             )
 
         root_index = failed[0]
@@ -409,9 +476,11 @@ class BlameAttributionEngine:
             message = rule.message_template.format(
                 error=root_step.error or "",
                 score=root_step.metrics.score or 0.0,
+                latency_ms=root_step.latency_ms or 0.0,
+                budget=budget_for(root_step, trajectory) or 0.0,
             )
 
-        cascade = self._build_cascade(root_index, steps, rule) if rule else []
+        cascade = self._build_cascade(root_index, steps, rule, trajectory) if rule else []
         counterfactuals = self._counterfactuals(root_index, steps, trajectory)
         remediation = self._suggest_remediation(root_step, failure_mode)
         rubric = self._build_rubric(trajectory, root_step, failure_mode)
@@ -440,6 +509,15 @@ class BlameAttributionEngine:
                 penalty += 0.05
         final_score = max(0.0, 1.0 - penalty)
 
+        step_timings = [
+            {
+                "step": step.step_name,
+                "latency_ms": step.latency_ms,
+                "total_tokens": step.tokens.total_tokens,
+            }
+            for step in steps
+        ]
+
         report = BlameReport(
             run_id=trajectory.run_id,
             root_cause_step=root_step.step_name,
@@ -452,6 +530,7 @@ class BlameAttributionEngine:
             rubric=rubric,
             llm_judgement=llm_judgement,
             score=round(final_score, 3),
+            step_timings=step_timings,
         )
 
         logger.info(

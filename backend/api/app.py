@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import os
 import time
-from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING
 
 import structlog
 from fastapi import FastAPI, Request, Response
@@ -15,6 +15,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 
 from backend.api.routes import (
     diagnosis,
+    documents,
     evals,
     optimization,
     pipelines,
@@ -24,6 +25,9 @@ from backend.api.routes import (
     tuning,
 )
 from backend.api.websocket import router as ws_router
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
 
 logger = structlog.get_logger(__name__)
 
@@ -118,7 +122,16 @@ class TimingMiddleware(BaseHTTPMiddleware):
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     logger.info("evalops_api_startup", version=app.version)
+    # Start the MongoDB mirror if configured (best-effort; non-fatal if down).
+    if os.environ.get("DATABASE_URL") is None and os.environ.get("MONGODB_URL"):
+        from backend.db.mongo_mirror import get_mirror
+
+        await get_mirror().start()
     yield
+    if os.environ.get("MONGODB_URL"):
+        from backend.db.mongo_mirror import get_mirror
+
+        await get_mirror().stop()
     logger.info("evalops_api_shutdown")
 
 
@@ -178,6 +191,7 @@ def create_app() -> FastAPI:
     application.include_router(tuning.router)
     application.include_router(diagnosis.router)
     application.include_router(settings.router)
+    application.include_router(documents.router)
     application.include_router(ws_router)
 
     # --- Health check -------------------------------------------------------

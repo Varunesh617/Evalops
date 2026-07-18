@@ -11,10 +11,12 @@ import abc
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+import httpx
 import structlog
 
-from backend.core.config import PipelineConfig, StepStatus
+from backend.core.config import PipelineConfig, RerankerModel, StepStatus
 from backend.core.llm_client import LLMClient, LLMClientError
+from backend.core.local_model_stats import attach_local_stats
 from backend.core.tracer import TokenUsage, Tracer, Trajectory
 
 logger = structlog.get_logger(__name__)
@@ -104,27 +106,230 @@ class _BaseStep(abc.ABC):
 
 
 class RetrieveStep(_BaseStep):
-    """Skeleton retrieval step."""
+    """Retrieve relevant documents from a vector store."""
 
     def __init__(self) -> None:
         super().__init__("retrieve")
 
     async def execute(self, context: PipelineContext) -> dict[str, Any]:
+        retrieval_cfg = context.config.retrieval
         logger.info("retrieve_started", query=context.query[:80])
-        # Real implementation will query vector store.
-        return {"status": "success", "documents": [], "count": 0}
+
+        try:
+            # Lazy import keeps this module importable even before the
+            # retrieval backend has landed.
+            from backend.retrieval.store import (
+                VectorStoreUnavailable,
+                get_vector_store,
+            )
+        except ImportError:
+            logger.warning("retrieve_backend_missing", fallback=True)
+            return {
+                "status": "success",
+                "documents": [],
+                "count": 0,
+                "retrieved": False,
+                "fallback": True,
+            }
+
+        try:
+            store = get_vector_store(retrieval_cfg)
+            results = await store.query(
+                context.query,
+                top_k=retrieval_cfg.top_k,
+                threshold=retrieval_cfg.similarity_threshold,
+            )
+        except (VectorStoreUnavailable, Exception) as exc:  # noqa: BLE001
+            logger.warning(
+                "retrieve_failed",
+                error=str(exc),
+                fallback=True,
+            )
+            return {
+                "status": "success",
+                "documents": [],
+                "count": 0,
+                "retrieved": False,
+                "fallback": True,
+            }
+
+        return {
+            "status": "success",
+            "documents": results,
+            "count": len(results),
+            "index_name": retrieval_cfg.index_name,
+            "retrieved": True,
+        }
+
+
+def _doc_text(doc: dict[str, Any]) -> str:
+    """Extract the textual body of a retrieved document."""
+    return doc.get("content") or doc.get("text") or ""
 
 
 class RerankStep(_BaseStep):
-    """Skeleton reranker step."""
+    """Rerank retrieved documents using a configured backend.
+
+    Supported backends (``context.config.reranker.model``):
+
+    * ``CROSS_ENCODER`` — lazily import ``sentence_transformers.CrossEncoder``
+      and score each doc against the query; falls back to embedding similarity
+      if the dependency is absent.
+    * ``COHERE`` — call the Cohere rerank API over HTTP when an API key is set;
+      falls back to embedding similarity when no key is present or on any error.
+    * ``CUSTOM`` — use embedding similarity as the rerank signal.
+
+    Graceful degradation: empty input is passed through unchanged, and any
+    irrecoverable failure returns the original docs with ``reranked=False`` and
+    ``fallback=True`` so the pipeline never breaks.
+    """
 
     def __init__(self) -> None:
         super().__init__("rerank")
 
     async def execute(self, context: PipelineContext) -> dict[str, Any]:
-        docs = context.documents
-        logger.info("rerank_started", input_count=len(docs))
-        return {"status": "success", "documents": docs}
+        cfg = context.config.reranker
+        docs = list(context.documents)
+        logger.info(
+            "rerank_started",
+            model=cfg.model.value,
+            input_count=len(docs),
+        )
+
+        if not docs:
+            return {
+                "status": "success",
+                "documents": [],
+                "reranked": False,
+                "method": "passthrough",
+                "count": 0,
+            }
+
+        top_k = max(1, cfg.top_k)
+        try:
+            if cfg.model == RerankerModel.CROSS_ENCODER:
+                ranked, method = await self._rerank_cross_encoder(context, docs, cfg)
+            elif cfg.model == RerankerModel.COHERE:
+                ranked, method = await self._rerank_cohere(context, docs, cfg)
+            else:  # CUSTOM
+                ranked, method = await self._rerank_embedding(context, docs)
+        except Exception as exc:
+            logger.warning("rerank_failed", error=str(exc))
+            return {
+                "status": "success",
+                "documents": docs,
+                "reranked": False,
+                "fallback": True,
+                "method": "passthrough",
+                "count": len(docs),
+            }
+
+        ranked = ranked[:top_k]
+        return {
+            "status": "success",
+            "documents": ranked,
+            "reranked": True,
+            "fallback": False,
+            "method": method,
+            "count": len(ranked),
+        }
+
+    async def _rerank_cross_encoder(
+        self,
+        context: PipelineContext,
+        docs: list[dict[str, Any]],
+        cfg: Any,
+    ) -> tuple[list[dict[str, Any]], str]:
+        try:
+            from sentence_transformers import CrossEncoder  # type: ignore
+        except Exception:
+            logger.info("rerank_cross_encoder_unavailable")
+            return await self._rerank_embedding(context, docs, "embedding_fallback")
+
+        try:
+            model = CrossEncoder(cfg.model_name)
+        except Exception as exc:
+            logger.warning("rerank_cross_encoder_load_failed", error=str(exc))
+            return await self._rerank_embedding(context, docs, "embedding_fallback")
+
+        pairs = [(context.query, _doc_text(d)) for d in docs]
+        try:
+            scores = list(model.predict(pairs, batch_size=cfg.batch_size))
+        except Exception as exc:
+            logger.warning("rerank_cross_encoder_predict_failed", error=str(exc))
+            return await self._rerank_embedding(context, docs, "embedding_fallback")
+
+        scored = [
+            {**d, "score": float(s)} for d, s in zip(docs, scores, strict=True)
+        ]
+        scored.sort(key=lambda d: d["score"], reverse=True)
+        return scored, "cross_encoder"
+
+    async def _rerank_embedding(
+        self,
+        context: PipelineContext,
+        docs: list[dict[str, Any]],
+        method: str = "embedding_custom",
+    ) -> tuple[list[dict[str, Any]], str]:
+        from backend.eval.similarity import embed_similarity
+
+        scored = [
+            {**d, "score": embed_similarity(context.query, _doc_text(d))}
+            for d in docs
+        ]
+        scored.sort(key=lambda d: d["score"], reverse=True)
+        return scored, method
+
+    async def _rerank_cohere(
+        self,
+        context: PipelineContext,
+        docs: list[dict[str, Any]],
+        cfg: Any,
+    ) -> tuple[list[dict[str, Any]], str]:
+        if not cfg.api_key:
+            logger.info("rerank_cohere_no_api_key")
+            return await self._rerank_embedding(context, docs, "embedding_fallback")
+
+        url = "https://api.cohere.ai/v1/rerank"
+        documents = [_doc_text(d) for d in docs]
+        payload = {
+            "model": cfg.model_name or "rerank-english-v3.0",
+            "query": context.query,
+            "documents": documents,
+            "top_n": max(1, cfg.top_k),
+        }
+        headers = {
+            "Authorization": f"Bearer {cfg.api_key.get_secret_value()}",
+            "Content-Type": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=cfg.timeout_seconds, follow_redirects=True
+            ) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+        except (httpx.TimeoutException, httpx.HTTPError, ValueError) as exc:
+            logger.warning("rerank_cohere_request_failed", error=str(exc))
+            return await self._rerank_embedding(context, docs, "embedding_fallback")
+
+        results = data.get("results", [])
+        if not results:
+            return await self._rerank_embedding(context, docs, "embedding_fallback")
+
+        ranked: list[dict[str, Any]] = []
+        covered: set[int] = set()
+        for item in results:
+            idx = int(item.get("index", -1))
+            score = float(item.get("relevance_score", 0.0))
+            if 0 <= idx < len(docs):
+                ranked.append({**docs[idx], "score": score})
+                covered.add(idx)
+        # Preserve any docs the API omitted (defensive).
+        for idx, d in enumerate(docs):
+            if idx not in covered:
+                ranked.append({**d, "score": 0.0})
+        return ranked, "cohere"
 
 
 class ReasonStep(_BaseStep):
@@ -175,6 +380,7 @@ class ReasonStep(_BaseStep):
             logger.warning("reason_llm_failed", error=str(exc))
             return {"status": "success", "reasoning": "", "llm_used": False}
 
+        await attach_local_stats(result, cfg.base_url, transport=None)
         return {
             "status": "success",
             "reasoning": result["text"],
@@ -244,6 +450,7 @@ class GenerateStep(_BaseStep):
             logger.warning("generate_llm_failed", error=str(exc))
             return {"status": "success", "text": "", "llm_used": False}
 
+        await attach_local_stats(result, cfg.base_url, transport=None)
         answer = result["text"]
         if cfg.include_citations and docs:
             answer = f"{answer}\n\nSources:\n" + "\n".join(
@@ -346,7 +553,36 @@ class PipelineExecutor:
                     ctx.results[pipeline_step.name] = result
         finally:
             self.tracer.finish(trajectory)
+        self._annotate_step_quality(trajectory)
         return trajectory
+
+    @staticmethod
+    def _annotate_step_quality(trajectory: Trajectory) -> None:
+        """Set a per-step quality proxy on ``step.metrics.score``.
+
+        Only sets a score where a meaningful signal is already available in the
+        step payload — no new network calls.  Never overwrites a lower existing
+        score (e.g. one populated earlier by an eval run).
+        """
+        for step in trajectory.steps:
+            if step.status != StepStatus.SUCCESS:
+                continue
+            result = step.payload.get("result", {})
+            value: float | None = None
+            if step.step_name in ("retrieve",):
+                value = 1.0 if result.get("count", 0) > 0 else 0.0
+            elif step.step_name == "guardrail":
+                value = 1.0 if result.get("passed") is True else 0.0
+            elif step.step_name == "rerank":
+                value = 1.0 if result.get("reranked") is True else 0.0
+            elif step.step_name in ("generate", "reason"):
+                if result.get("llm_used") is True:
+                    value = 1.0
+                else:
+                    value = 0.0
+            if value is None:
+                continue
+            step.metrics.score = max(step.metrics.score or 0.0, value)
 
 
 # ---------------------------------------------------------------------------

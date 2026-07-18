@@ -14,6 +14,7 @@ from typing import Any
 
 from backend.eval.blame_attribution import BlameAttributionEngine
 from backend.eval.engine import EvalEngine
+from backend.db.mongo_mirror import MongoMirror, get_mirror
 
 # ---------------------------------------------------------------------------
 # Determine which repository implementation to use
@@ -37,11 +38,44 @@ if not _database_url:
         TraceRepository as _InMemTraceRepo,
     )
 
+    _mongo_url = os.environ.get("MONGODB_URL")
+    _mirror: MongoMirror | None = get_mirror() if _mongo_url else None
+
+    def _wrap(repo_name: str, repo: Any) -> Any:
+        """Return a mirror-aware subclass instance when MONGODB_URL is set.
+
+        The in-memory store stays the source of truth for reads; writes are
+        mirrored to MongoDB (best-effort) after they succeed locally.
+        """
+        if _mirror is None:
+            return repo
+
+        base = type(repo)
+
+        class _MirrorRepo(base):  # type: ignore[valid-type,misc]
+            async def create(self, record):  # type: ignore[override]
+                result = await super().create(record)
+                await _mirror.write(repo_name, result)
+                return result
+
+            async def update(self, record_id, updates):  # type: ignore[override]
+                result = await super().update(record_id, updates)
+                if result is not None:
+                    await _mirror.write(repo_name, result)
+                return result
+
+            async def delete(self, record_id):  # type: ignore[override]
+                result = await super().delete(record_id)
+                await _mirror.delete(repo_name, record_id)
+                return result
+
+        return _MirrorRepo()
+
     _in_memory = {
-        "pipeline": _InMemPipelineRepo(),
-        "trace": _InMemTraceRepo(),
-        "eval": _InMemEvalRepo(),
-        "sweep": _InMemSweepRepo(),
+        "pipeline": _wrap("pipeline", _InMemPipelineRepo()),
+        "trace": _wrap("trace", _InMemTraceRepo()),
+        "eval": _wrap("eval", _InMemEvalRepo()),
+        "sweep": _wrap("sweep", _InMemSweepRepo()),
     }
 
 
