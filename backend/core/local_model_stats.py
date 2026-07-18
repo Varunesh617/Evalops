@@ -12,6 +12,8 @@ a trace payload can never break the pipeline.
 
 from __future__ import annotations
 
+import asyncio
+import subprocess
 import time
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -46,6 +48,115 @@ def _strip_to_origin(base_url: str) -> str:
     """Reduce ``http://localhost:11434/v1`` to ``http://localhost:11434``."""
     parts = urlsplit(base_url)
     return urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+
+
+async def fetch_model_details(
+    base_url: str,
+    model_name: str,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> dict[str, Any]:
+    """Fetch architecture details for a local model via Ollama ``/api/show``.
+
+    Returns a structured dict.  Never raises — any error is captured into the
+    returned dict.  Only attempted for local endpoints; cloud endpoints get a
+    note instead.
+    """
+    if not is_local_endpoint(base_url):
+        return {
+            "name": model_name,
+            "note": "model-details only available for local endpoints",
+        }
+
+    origin = _strip_to_origin(base_url)
+    try:
+        async with httpx.AsyncClient(
+            timeout=3.0, follow_redirects=True, transport=transport
+        ) as client:
+            resp = await client.post(
+                f"{origin}/api/show", json={"model": model_name}
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+
+        details = payload.get("details", {}) or {}
+        if not isinstance(details, dict):
+            details = {}
+        model_info = payload.get("model_info", {}) or {}
+        if not isinstance(model_info, dict):
+            model_info = {}
+
+        families = details.get("families") or []
+        family = details.get("family")
+        if not family and isinstance(families, list) and families:
+            family = families[0]
+
+        layer_count = model_info.get("ssm_block_count")
+        if layer_count is None:
+            layer_count = model_info.get("block_count")
+
+        return {
+            "name": model_name,
+            "parameter_size": details.get("parameter_size"),
+            "quantization_level": details.get("quantization_level"),
+            "context_length": details.get("context_length"),
+            "format": details.get("format"),
+            "family": family,
+            "layer_count": layer_count,
+            "details_ok": True,
+            "error": None,
+        }
+    except (httpx.TimeoutException, httpx.HTTPError, OSError, ValueError, KeyError) as exc:
+        return {
+            "name": model_name,
+            "parameter_size": None,
+            "quantization_level": None,
+            "context_length": None,
+            "format": None,
+            "family": None,
+            "layer_count": None,
+            "details_ok": False,
+            "error": str(exc),
+        }
+
+
+def _gpu_stats_sync() -> dict[str, Any]:
+    """Synchronously query ``nvidia-smi`` for GPU stats (runs in a thread)."""
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.used,memory.total,utilization.gpu",
+                "--format=csv,noheader",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if proc.returncode != 0:
+            return {"available": False, "error": f"nvidia-smi rc={proc.returncode}"}
+
+        line = proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
+        name, used, total, util = [part.strip() for part in line.split(",")]
+        used_mib = int(used.replace("MiB", "").strip())
+        total_mib = int(total.replace("MiB", "").strip())
+        util_pct = float(util.replace("%", "").strip())
+
+        return {
+            "available": True,
+            "gpu_name": name,
+            "vram_used_mib": used_mib,
+            "vram_total_mib": total_mib,
+            "gpu_utilization_pct": util_pct,
+            "error": None,
+        }
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError, IndexError) as exc:
+        return {"available": False, "error": str(exc)}
+
+
+async def fetch_gpu_stats() -> dict[str, Any]:
+    """Fetch GPU stats by running ``nvidia-smi`` in a thread. Never raises."""
+    return await asyncio.to_thread(_gpu_stats_sync)
 
 
 async def fetch_local_stats(
@@ -85,11 +196,20 @@ async def fetch_local_stats(
                             ]
                 except ValueError:
                     pass
+                if models:
+                    model_details = await fetch_model_details(
+                        base_url, models[0], transport=transport
+                    )
+                else:
+                    model_details = None
+                gpu = await fetch_gpu_stats()
                 return {
                     "source": "local",
                     "kind": "ollama",
                     "available": True,
                     "models": models,
+                    "model_details": model_details,
+                    "gpu": gpu,
                     "latency_probe_ms": (time.perf_counter() - start) * 1000.0,
                     "error": None,
                 }
@@ -104,11 +224,14 @@ async def fetch_local_stats(
         ) as client:
             resp = await client.get(f"{origin}/")
             available = resp.status_code < 400
+            gpu = await fetch_gpu_stats()
             return {
                 "source": "local",
                 "kind": "unknown-local",
                 "available": available,
                 "models": [],
+                "model_details": None,
+                "gpu": gpu,
                 "latency_probe_ms": (time.perf_counter() - start) * 1000.0,
                 "error": None if available else f"status {resp.status_code}",
             }
@@ -119,6 +242,8 @@ async def fetch_local_stats(
             "kind": "unknown-local",
             "available": False,
             "models": [],
+            "model_details": None,
+            "gpu": await fetch_gpu_stats(),
             "latency_probe_ms": (time.perf_counter() - start) * 1000.0,
             "error": str(exc),
         }
