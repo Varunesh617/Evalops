@@ -58,9 +58,23 @@ export default function EvalsPage() {
     setRunLoading(true);
     setRunError(null);
     try {
-      const result = await evals.run([
-        { trajectory_id: trajectoryId.trim(), metrics: selectedMetrics },
-      ]);
+      const result = await evals.run({
+        trajectory: {
+          trajectory_id: trajectoryId.trim(),
+          query: trajectoryId.trim(),
+          steps: [
+            {
+              step_id: 0,
+              step_type: "answer",
+              output_text: trajectoryId.trim(),
+              tokens_used: 0,
+              cost_usd: 0.0,
+              metadata: {},
+            },
+          ],
+        },
+        metrics: selectedMetrics,
+      });
       setLastResult(result);
     } catch (err) {
       setRunError(err instanceof Error ? err.message : "Failed to run evaluation");

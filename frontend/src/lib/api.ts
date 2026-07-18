@@ -496,8 +496,14 @@ export const traces = {
 };
 
 // Evals
+export interface EvalRunBody {
+  trajectory: Record<string, unknown>;
+  metrics: string[];
+  metadata?: Record<string, unknown>;
+}
+
 export const evals = {
-  run: (body: { trajectory_id: string; metrics: string[] }[]) =>
+  run: (body: EvalRunBody) =>
     request<EvalResult>("/evals", { method: "POST", body: JSON.stringify(body) }),
   get: (id: string) => request<EvalResult>(`/evals/${id}`),
   compare: (evalA: string, evalB: string) =>
